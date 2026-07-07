@@ -16,7 +16,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use agent_mission_control::{MissionControlView, ThreadDigest, fixtures, store};
+use agent_mission_control::{MissionControlView, ThreadDigest, TriageState, fixtures, store};
 use gpui::{AppContext as _, HeadlessAppContext, px, size};
 
 fn main() {
@@ -53,6 +53,14 @@ fn main() {
             std::process::exit(2);
         }
     };
+
+    for state in TriageState::ALL {
+        let count = digests
+            .iter()
+            .filter(|digest| digest.state == state)
+            .count();
+        eprintln!("{:>14}: {}", state.label(), count);
+    }
 
     let output_dir = PathBuf::from("target/visual");
     std::fs::create_dir_all(&output_dir).expect("creating target/visual");

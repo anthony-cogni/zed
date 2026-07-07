@@ -24,7 +24,7 @@ fn digest(
     )
 }
 
-/// Ten realistic threads covering all four triage states.
+/// Eleven realistic threads covering all four triage states.
 pub fn fixture_digests() -> Vec<ThreadDigest> {
     vec![
         digest(
@@ -128,6 +128,17 @@ pub fn fixture_digests() -> Vec<ThreadDigest> {
             false,
         ),
         digest(
+            "fixture-11",
+            "Connector retry backoff hardening",
+            75,
+            21,
+            Some(Role::Agent),
+            "What I set out to do: harden the connector retry backoff. What I did: \
+             capped the exponent, added jitter, and property-tested the schedule. \
+             What is left: nothing. **What I need from you**: merge PR #140",
+            false,
+        ),
+        digest(
             "fixture-10",
             "Threads.db introspection skill",
             5800,
@@ -149,7 +160,7 @@ mod tests {
     #[test]
     fn fixtures_cover_all_states() {
         let digests = fixture_digests();
-        assert_eq!(digests.len(), 10);
+        assert_eq!(digests.len(), 11);
         for state in TriageState::ALL {
             assert!(
                 digests.iter().any(|digest| digest.state == state),

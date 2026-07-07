@@ -12,7 +12,7 @@ pub mod triage;
 use chrono::{DateTime, Utc};
 
 pub use panel::{MissionControlPanel, MissionControlView, ToggleFocus, init};
-pub use triage::{Role, Triage, TriageState};
+pub use triage::{Ask, Role, Triage, TriageState};
 
 /// A plain summary of one agent thread, ready for triage and display.
 #[derive(Debug, Clone)]
