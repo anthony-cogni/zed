@@ -1,0 +1,54 @@
+[package]
+name = "agent_mission_control"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license = "GPL-3.0-or-later"
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/agent_mission_control.rs"
+
+[features]
+default = []
+visual-tests = [
+    "gpui/test-support",
+    "gpui_platform/test-support",
+    "gpui_platform/font-kit",
+    "dep:image",
+    "dep:assets",
+    "dep:theme_settings",
+    "dep:env_logger",
+]
+
+[[bin]]
+name = "mission_control_visual"
+path = "src/bin/visual.rs"
+required-features = ["visual-tests"]
+
+[dependencies]
+anyhow.workspace = true
+assets = { workspace = true, optional = true }
+chrono.workspace = true
+env_logger = { workspace = true, optional = true }
+gpui.workspace = true
+gpui_platform.workspace = true
+image = { workspace = true, optional = true }
+log.workspace = true
+paths.workspace = true
+regex.workspace = true
+serde_json.workspace = true
+settings.workspace = true
+sqlez.workspace = true
+tempfile.workspace = true
+theme.workspace = true
+theme_settings = { workspace = true, optional = true }
+ui.workspace = true
+util.workspace = true
+workspace.workspace = true
+zstd.workspace = true
+
+[dev-dependencies]
+pretty_assertions.workspace = true

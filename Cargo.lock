@@ -369,6 +369,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "agent_mission_control"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "assets",
+ "chrono",
+ "env_logger 0.11.8",
+ "gpui",
+ "gpui_platform",
+ "image",
+ "log",
+ "paths",
+ "pretty_assertions",
+ "regex",
+ "serde_json",
+ "settings",
+ "sqlez",
+ "tempfile",
+ "theme",
+ "theme_settings",
+ "ui",
+ "util",
+ "workspace",
+ "zstd",
+]
+
+[[package]]
 name = "agent_servers"
 version = "0.1.0"
 dependencies = [
@@ -22998,6 +23025,7 @@ dependencies = [
  "activity_indicator",
  "agent",
  "agent-client-protocol",
+ "agent_mission_control",
  "agent_servers",
  "agent_settings",
  "agent_skills",
