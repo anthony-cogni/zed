@@ -54,7 +54,8 @@ actions!(
         Undo,
         /// Redoes the last undone map operation.
         Redo,
-        /// Expands/collapses the focused item's brief detail pane.
+        /// Opens the focused item in the Workcat Detail panel (or
+        /// confirms the lens name while naming a lens).
         ToggleDetail,
         /// Re-lays out the visible nodes on the deterministic grid.
         AutoArrange,
@@ -64,8 +65,6 @@ actions!(
         SaveLensPrompt,
         /// Confirms the lens name being typed.
         ConfirmLensName,
-        /// Saves the focused item's notes from the notes editor.
-        SaveNotes,
     ]
 );
 
@@ -91,6 +90,15 @@ pub struct ApplyLens {
 pub struct DeleteLens {
     pub name: String,
 }
+
+/// Global registry connecting the map panel to the detail panel: the
+/// map view publishes a weak handle to itself here on creation, and
+/// the detail panel observes it (panels load concurrently, in either
+/// order).
+#[derive(Default)]
+pub struct WorkcatMapHandle(pub Option<WeakEntity<WorkcatMapView>>);
+
+impl gpui::Global for WorkcatMapHandle {}
 
 const WORKCAT_MAP_PANEL_KEY: &str = "WorkcatMapPanel";
 const DEFAULT_WIDTH: f32 = 640.;
@@ -160,11 +168,6 @@ pub struct WorkcatMapView {
     lens_name_editor: Entity<Editor>,
     /// Session undo/redo (200 steps, event-sourced compensations).
     undo_stack: UndoStack,
-    /// Whether the focused item's brief body is expanded.
-    detail_expanded: bool,
-    notes_editor: Entity<Editor>,
-    /// Which item id the notes editor currently holds text for.
-    notes_item: Option<String>,
     panel_focused: bool,
     status: SharedString,
     loading: bool,
@@ -191,11 +194,7 @@ impl WorkcatMapView {
             editor.set_placeholder_text("Lens name\u{2026}", window, cx);
             editor
         });
-        let notes_editor = cx.new(|cx| {
-            let mut editor = Editor::auto_height(1, 6, window, cx);
-            editor.set_placeholder_text("Notes\u{2026}", window, cx);
-            editor
-        });
+        cx.set_global(WorkcatMapHandle(Some(cx.weak_entity())));
         let subscriptions = vec![
             cx.on_focus(&focus_handle, window, |this, _, cx| {
                 this.panel_focused = true;
@@ -265,9 +264,6 @@ impl WorkcatMapView {
             naming_lens: false,
             lens_name_editor,
             undo_stack: UndoStack::default(),
-            detail_expanded: false,
-            notes_editor,
-            notes_item: None,
             panel_focused: false,
             status: "loading workcat-db...".into(),
             loading: true,
@@ -381,7 +377,7 @@ impl WorkcatMapView {
             .position(|node| self.items[node.item_ix].id == id)
     }
 
-    fn focused_item(&self) -> Option<&ItemMeta> {
+    pub fn focused_item(&self) -> Option<&ItemMeta> {
         let node = self.nodes.get(self.focused_node?)?;
         self.items.get(node.item_ix)
     }
@@ -415,7 +411,6 @@ impl WorkcatMapView {
                 vec![(node_ix, (node.x, node.y))]
             };
         self.focused_node = Some(node_ix);
-        self.sync_notes_editor(window, cx);
         self.drag = Some(DragState {
             pressed_ix: node_ix,
             pointer_start: pointer,
@@ -552,7 +547,6 @@ impl WorkcatMapView {
         self.selected.clear();
         self.rect_select = None;
         self.naming_lens = false;
-        self.detail_expanded = false;
         window.focus(&self.focus_handle, cx);
         cx.notify();
     }
@@ -743,11 +737,12 @@ impl WorkcatMapView {
         cx.notify();
     }
 
-    // === Detail pane & notes ===
+    // === Detail panel & notes ===
 
+    /// `enter`: open the detail panel on the focused item — or, while
+    /// naming a lens, confirm the name instead (the single-line editor
+    /// lets `enter` bubble up to this context).
     fn toggle_detail(&mut self, _: &ToggleDetail, window: &mut Window, cx: &mut Context<Self>) {
-        // Enter while naming a lens confirms the name instead (the
-        // single-line editor lets `enter` bubble up to this context).
         if self.naming_lens {
             self.confirm_lens_name(&ConfirmLensName, window, cx);
             return;
@@ -757,43 +752,19 @@ impl WorkcatMapView {
             cx.notify();
             return;
         }
-        self.detail_expanded = !self.detail_expanded;
-        self.sync_notes_editor(window, cx);
-        cx.notify();
+        window.dispatch_action(Box::new(crate::detail_panel::ToggleDetailPanelFocus), cx);
     }
 
-    /// Keep the notes editor's text in step with the focused item.
-    fn sync_notes_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(item) = self.focused_item() else {
-            self.notes_item = None;
-            return;
-        };
-        let id = item.id.clone();
-        if self.notes_item.as_deref() == Some(id.as_str()) {
-            return;
-        }
-        let notes = item.notes().unwrap_or_default().to_string();
-        self.notes_item = Some(id);
-        self.notes_editor.update(cx, |editor, cx| {
-            editor.set_text(notes, window, cx);
-        });
-    }
-
-    /// Whole-section replace of the focused item's `## Notes` from the
-    /// notes editor (`brief_edited`, workcat-db commit 87fb2b8). The
+    /// Whole-section replace of an item's `## Notes` (`brief_edited`,
+    /// workcat-db commit 87fb2b8), called by the detail panel. The
     /// brief file re-materializes at the next checkpoint's fold.
-    fn save_notes(&mut self, _: &SaveNotes, _window: &mut Window, cx: &mut Context<Self>) {
-        let Some(node_ix) = self.focused_node else {
-            return;
+    /// Returns a human-readable status line.
+    pub fn save_notes_for(&mut self, id: &str, text: String, cx: &mut Context<Self>) -> String {
+        let Some(item) = self.items.iter_mut().find(|item| item.id == id) else {
+            return format!("no item {id}");
         };
-        let item_ix = self.nodes[node_ix].item_ix;
-        let text = self.notes_editor.read(cx).text(cx).trim().to_string();
-        let item = &mut self.items[item_ix];
-        let existing = item.notes().unwrap_or_default();
-        if existing == text {
-            self.status = "notes unchanged".into();
-            cx.notify();
-            return;
+        if item.notes().unwrap_or_default() == text {
+            return "notes unchanged".to_string();
         }
         if let Some(section) = item
             .sections
@@ -804,10 +775,11 @@ impl WorkcatMapView {
         } else {
             item.sections.push(("Notes".to_string(), text.clone()));
         }
-        let id = item.id.clone();
+        let id = id.to_string();
         self.append_to_log(store::brief_edited_event(&id, "Notes", &text), cx);
         self.status = "notes saved (uncommitted)".into();
         cx.notify();
+        "notes saved (uncommitted)".to_string()
     }
 
     // === Writes ===
@@ -963,7 +935,7 @@ impl WorkcatMapView {
                 );
             }
             menu.separator()
-                .action("Expand Detail", Box::new(ToggleDetail))
+                .action("Open Detail Panel", Box::new(ToggleDetail))
                 .action("Checkpoint Now", Box::new(Checkpoint))
         });
         self.show_context_menu(context_menu, position, window, cx);
@@ -1041,7 +1013,7 @@ impl WorkcatMapView {
 
     // === Rendering ===
 
-    fn status_color(status: Status, cx: &App) -> Hsla {
+    pub fn status_color(status: Status, cx: &App) -> Hsla {
         let colors = cx.theme().status();
         match status {
             Status::NotStarted => colors.ignored,
@@ -1193,7 +1165,6 @@ impl WorkcatMapView {
         let item = self.focused_item()?;
         let colors = cx.theme().colors().clone();
         let status_color = Self::status_color(item.status, cx);
-        let expanded = self.detail_expanded;
         let strip = h_flex()
             .w_full()
             .px_2()
@@ -1204,11 +1175,7 @@ impl WorkcatMapView {
             .bg(colors.element_background)
             .id("workcat-detail-strip")
             .cursor_pointer()
-            .tooltip(ui::Tooltip::text(if expanded {
-                "Collapse detail (enter)"
-            } else {
-                "Expand detail (enter)"
-            }))
+            .tooltip(ui::Tooltip::text("Open in Workcat Detail panel (enter)"))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _: &MouseDownEvent, window, cx| {
@@ -1238,67 +1205,6 @@ impl WorkcatMapView {
                     .color(Color::Muted),
             );
         Some(strip)
-    }
-
-    /// The expanded brief body: every section (State/Next/Context/
-    /// Hazards/Notes) as plain text, plus the notes editor.
-    fn render_detail_pane(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
-        if !self.detail_expanded {
-            return None;
-        }
-        let item = self.focused_item()?;
-        let colors = cx.theme().colors().clone();
-        let mut pane = v_flex()
-            .w_full()
-            .max_h(px(320.))
-            .px_2()
-            .py_1()
-            .gap_1()
-            .border_b_1()
-            .border_color(colors.border)
-            .bg(colors.panel_background)
-            .id("workcat-detail-pane")
-            .overflow_y_scroll();
-        for (heading, body) in &item.sections {
-            if heading.eq_ignore_ascii_case("notes") {
-                continue; // Rendered as the editable notes field below.
-            }
-            pane = pane.child(
-                Label::new(heading.clone())
-                    .size(LabelSize::Small)
-                    .weight(gpui::FontWeight::BOLD)
-                    .color(Color::Accent),
-            );
-            for line in body.lines() {
-                pane = pane.child(Label::new(line.to_string()).size(LabelSize::XSmall));
-            }
-        }
-        pane = pane
-            .child(
-                Label::new("Notes")
-                    .size(LabelSize::Small)
-                    .weight(gpui::FontWeight::BOLD)
-                    .color(Color::Accent),
-            )
-            .child(
-                div()
-                    .w_full()
-                    .px_1()
-                    .rounded_sm()
-                    .border_1()
-                    .border_color(colors.border_variant)
-                    .child(self.notes_editor.clone()),
-            )
-            .child(
-                h_flex().w_full().justify_end().child(
-                    Button::new("save-notes", "Save Notes")
-                        .label_size(LabelSize::XSmall)
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.save_notes(&SaveNotes, window, cx);
-                        })),
-                ),
-            );
-        Some(pane)
     }
 
     /// Dependency edges, drawn under the nodes: a line from each
@@ -1586,13 +1492,11 @@ impl Render for WorkcatMapView {
             .on_action(cx.listener(Self::delete_lens))
             .on_action(cx.listener(Self::save_lens_prompt))
             .on_action(cx.listener(Self::confirm_lens_name))
-            .on_action(cx.listener(Self::save_notes))
             .size_full()
             .bg(cx.theme().colors().panel_background)
             .child(self.render_header(cx))
             .child(self.render_filter_row(cx))
             .children(self.render_detail_strip(cx))
-            .children(self.render_detail_pane(cx))
             .child(self.render_field(cx))
             .children(self.context_menu.as_ref().map(|(menu, position, _)| {
                 deferred(

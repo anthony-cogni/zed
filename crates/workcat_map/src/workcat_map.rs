@@ -16,11 +16,20 @@
 //!   keys); appends `status_set`, re-folds briefs via `tools/fold.py`,
 //!   and checkpoints immediately under the write lock.
 
+mod detail_panel;
 pub mod geometry;
 pub mod model;
 mod panel;
 pub mod store;
 
+pub use detail_panel::{ToggleDetailPanelFocus, WorkcatDetailPanel, WorkcatDetailView};
 pub use panel::{
-    Checkpoint, ClearFocus, SetStatus, ToggleFocus, WorkcatMapPanel, WorkcatMapView, init,
+    Checkpoint, ClearFocus, SetStatus, ToggleFocus, WorkcatMapHandle, WorkcatMapPanel,
+    WorkcatMapView,
 };
+
+/// Registers both panels' workspace actions.
+pub fn init(cx: &mut gpui::App) {
+    panel::init(cx);
+    detail_panel::init(cx);
+}

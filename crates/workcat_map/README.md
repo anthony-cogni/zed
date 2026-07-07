@@ -71,11 +71,18 @@ next checkpoint carries it.
 **Auto-arrange**: `a` (or the background menu) re-lays the visible
 nodes out on the deterministic grid, as one undoable step.
 
-**Detail pane + notes**: `enter` (or click the detail strip) expands
-the focused item's brief body — State/Next/Context/Hazards as plain
-text — plus an editable Notes field. `Save Notes` appends a
-`brief_edited` event (whole-section replace, section `Notes`); the
-brief file re-materializes at the next checkpoint's fold.
+**Detail panel + notes**: a second, separate dock panel ("Workcat
+Detail", Reader icon — a real `workspace::Panel` like the agent
+panel, not an inline strip). `enter` on a focused node (or clicking
+the map's detail strip) opens it; it shows the brief body —
+State/Next/Context/Hazards as plain text — plus an editable Notes
+field. `Save Notes` appends a `brief_edited` event (whole-section
+replace, section `Notes`); the brief file re-materializes at the next
+checkpoint's fold. The two panels talk through a `WorkcatMapHandle`
+global: the map registers a weak handle to itself; the detail panel
+observes the map entity and re-renders on every focus/mutation. Notes
+writes flow back through the map view, keeping the event-append path
+and the pending-events counter in one place.
 
 ## The write protocol
 
@@ -101,8 +108,10 @@ status changes and on the manual Checkpoint action (`c`).
   Unit-tested.
 - `store.rs` — IO shell: brief/event reads, event appends, and the
   checkpoint subprocess cycle (async, background executor).
-- `panel.rs` — the GPUI view, actions, context menu, and the `Panel`
-  wrapper.
+- `panel.rs` — the map GPUI view, actions, context menu, and the
+  `Panel` wrapper.
+- `detail_panel.rs` — the separate Workcat Detail dock panel (brief
+  body + notes editing).
 - `examples/workcat_cycle.rs` — headless driver for the same store
   code paths: `load`, `move`, `status`, `checkpoint`. Point
   `WORKCAT_DB_DIR` at a throwaway clone to prove the cycle safely.
