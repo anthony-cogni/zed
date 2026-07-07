@@ -10,6 +10,8 @@
 //! cargo run -p workcat_map --example workcat_cycle -- move <item-id> <x> <y>
 //! cargo run -p workcat_map --example workcat_cycle -- status <item-id> <status>
 //! cargo run -p workcat_map --example workcat_cycle -- checkpoint
+//! cargo run -p workcat_map --example workcat_cycle -- lenses
+//! cargo run -p workcat_map --example workcat_cycle -- notes <item-id8>
 //! ```
 //!
 //! `move` only appends (fine grain); `status` and `checkpoint` run the
@@ -87,6 +89,32 @@ fn main() -> anyhow::Result<()> {
             drop(progress);
             printer.join().ok();
             println!("checkpoint: {sha:?}");
+        }
+        Some("lenses") => {
+            let lenses = store::load_lenses(&db)?;
+            println!("lenses: {}", lenses.len());
+            for lens in lenses.values() {
+                println!(
+                    "  {} \u{2014} statuses [{}], query {:?}",
+                    lens.name,
+                    lens.visible_statuses.join(", "),
+                    lens.query,
+                );
+            }
+        }
+        Some("notes") => {
+            let id8 = args.get(1).expect(usage);
+            let items = store::load_items(&db)?;
+            let item = items
+                .iter()
+                .find(|item| item.id8() == id8)
+                .expect("item with that id8");
+            println!("subject: {}", item.subject);
+            println!("sections: {}", item.sections.len());
+            match item.notes() {
+                Some(notes) => println!("notes:\n{notes}"),
+                None => println!("notes: (none)"),
+            }
         }
         _ => anyhow::bail!(usage),
     }

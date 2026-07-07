@@ -1,5 +1,8 @@
-//! The Workcat Map dock panel, v1: read, focus, drag, set status
-//! (DR-005 ruling 17) against the workcat-db repo-as-database.
+//! The Workcat Map dock panel: read, focus, drag, set status (DR-005
+//! ruling 17) against the workcat-db repo-as-database — plus the
+//! SPA-parity pass: filters + search, saved lenses, rect-select
+//! multi-node move, session undo/redo, auto-arrange, a detail pane
+//! with the brief body, and notes editing.
 //!
 //! Dragging is direct manipulation: mouse down on a node starts a
 //! gesture, window-level mouse events move it, and mouse up commits: a
@@ -7,10 +10,17 @@
 //! (the fine grain), while git commit/push happens at checkpoints (the
 //! coarse grain, DR-006): on every status change and on the manual
 //! Checkpoint action.
+//!
+//! Undo is event-sourced and pane-focus scoped (DR-005 ruling 16):
+//! undoing appends compensating events restoring the prior value; the
+//! log is never rewritten, and Zed's editor history is untouched.
 
-use std::collections::HashMap;
+use std::cell::Cell;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::rc::Rc;
 
 use anyhow::Result;
+use editor::{Editor, EditorEvent};
 use futures::StreamExt as _;
 use gpui::{
     App, AsyncWindowContext, Context, DismissEvent, DispatchPhase, Entity, EventEmitter,
@@ -25,7 +35,7 @@ use workspace::{
 };
 
 use crate::geometry;
-use crate::model::{ALL_STATUSES, ItemMeta, Status};
+use crate::model::{ALL_STATUSES, FilterState, ItemMeta, Lens, Op, Status, UndoStack};
 use crate::store;
 
 actions!(
@@ -36,8 +46,26 @@ actions!(
         /// Commits and pushes the session's pending events (write lock,
         /// fold, commit, push).
         Checkpoint,
-        /// Clears the focused node.
+        /// Clears the focused node, selection, and any pending lens
+        /// naming.
         ClearFocus,
+        /// Undoes the last map operation (move or status change) by
+        /// appending compensating events.
+        Undo,
+        /// Redoes the last undone map operation.
+        Redo,
+        /// Expands/collapses the focused item's brief detail pane.
+        ToggleDetail,
+        /// Re-lays out the visible nodes on the deterministic grid.
+        AutoArrange,
+        /// Resets filters and search to the default scope.
+        ClearFilter,
+        /// Starts naming a lens to save the current filter as.
+        SaveLensPrompt,
+        /// Confirms the lens name being typed.
+        ConfirmLensName,
+        /// Saves the focused item's notes from the notes editor.
+        SaveNotes,
     ]
 );
 
@@ -48,6 +76,20 @@ actions!(
 #[action(namespace = workcat_map)]
 pub struct SetStatus {
     pub status: String,
+}
+
+/// Applies a saved lens by name.
+#[derive(Clone, PartialEq, serde::Deserialize, schemars::JsonSchema, gpui::Action)]
+#[action(namespace = workcat_map)]
+pub struct ApplyLens {
+    pub name: String,
+}
+
+/// Deletes a saved lens by name.
+#[derive(Clone, PartialEq, serde::Deserialize, schemars::JsonSchema, gpui::Action)]
+#[action(namespace = workcat_map)]
+pub struct DeleteLens {
+    pub name: String,
 }
 
 const WORKCAT_MAP_PANEL_KEY: &str = "WorkcatMapPanel";
@@ -71,11 +113,20 @@ struct MapNode {
     label: SharedString,
 }
 
-/// An in-flight drag gesture.
+/// An in-flight drag gesture: the pressed node plus (for a group
+/// drag over a selection) every other node moving with it.
 struct DragState {
-    node_ix: usize,
+    /// The node the gesture started on.
+    pressed_ix: usize,
     pointer_start: Point<Pixels>,
-    node_start: (f32, f32),
+    /// Every node moving in this gesture with its start position.
+    starts: Vec<(usize, (f32, f32))>,
+}
+
+/// An in-flight rectangle-selection gesture, in field coordinates.
+struct RectSelect {
+    start: (f32, f32),
+    current: (f32, f32),
 }
 
 /// The map view. Standalone `Render`-able, needs no `Workspace`.
@@ -86,12 +137,34 @@ pub struct WorkcatMapView {
     /// Owned geometry, keyed by full item id. Persisted `node_moved`
     /// positions plus pinned initial-grid slots.
     positions: HashMap<String, (f32, f32)>,
-    /// Visible nodes (default scope, DR-003 ruling 7).
+    /// Visible nodes (per the current filter).
     nodes: Vec<MapNode>,
     /// Dependency edges between visible nodes (dependent -> dependency).
     edges: Vec<(usize, usize)>,
     focused_node: Option<usize>,
+    /// Multi-selection, keyed by item id (stable across rebuilds).
+    selected: HashSet<String>,
     drag: Option<DragState>,
+    rect_select: Option<RectSelect>,
+    /// The field content's window-space origin, captured at paint time
+    /// so background gestures can be mapped into field coordinates.
+    field_origin: Rc<Cell<Point<Pixels>>>,
+    /// The visibility filter (statuses + free-text query).
+    filter: FilterState,
+    search_editor: Entity<Editor>,
+    /// Saved lenses folded from the event log.
+    lenses: BTreeMap<String, Lens>,
+    active_lens: Option<String>,
+    /// When true, the header shows the lens-name input.
+    naming_lens: bool,
+    lens_name_editor: Entity<Editor>,
+    /// Session undo/redo (200 steps, event-sourced compensations).
+    undo_stack: UndoStack,
+    /// Whether the focused item's brief body is expanded.
+    detail_expanded: bool,
+    notes_editor: Entity<Editor>,
+    /// Which item id the notes editor currently holds text for.
+    notes_item: Option<String>,
     panel_focused: bool,
     status: SharedString,
     loading: bool,
@@ -102,13 +175,28 @@ pub struct WorkcatMapView {
     append_task: Option<Task<()>>,
     checkpoint_task: Option<Task<()>>,
     _load_task: Task<()>,
-    _focus_subscriptions: Vec<Subscription>,
+    _subscriptions: Vec<Subscription>,
 }
 
 impl WorkcatMapView {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let focus_handle = cx.focus_handle();
-        let focus_subscriptions = vec![
+        let search_editor = cx.new(|cx| {
+            let mut editor = Editor::single_line(window, cx);
+            editor.set_placeholder_text("Search subject or ref\u{2026}", window, cx);
+            editor
+        });
+        let lens_name_editor = cx.new(|cx| {
+            let mut editor = Editor::single_line(window, cx);
+            editor.set_placeholder_text("Lens name\u{2026}", window, cx);
+            editor
+        });
+        let notes_editor = cx.new(|cx| {
+            let mut editor = Editor::auto_height(1, 6, window, cx);
+            editor.set_placeholder_text("Notes\u{2026}", window, cx);
+            editor
+        });
+        let subscriptions = vec![
             cx.on_focus(&focus_handle, window, |this, _, cx| {
                 this.panel_focused = true;
                 cx.notify();
@@ -117,6 +205,21 @@ impl WorkcatMapView {
                 this.panel_focused = false;
                 cx.notify();
             }),
+            cx.subscribe_in(
+                &search_editor,
+                window,
+                |this: &mut Self, editor, event, _window, cx| {
+                    if let EditorEvent::BufferEdited = event {
+                        let query = editor.read(cx).text(cx);
+                        if this.filter.query != query {
+                            this.filter.query = query;
+                            this.active_lens = None;
+                            this.rebuild_scene();
+                            cx.notify();
+                        }
+                    }
+                },
+            ),
         ];
 
         let load_task = cx.spawn(async move |this, cx| {
@@ -125,11 +228,15 @@ impl WorkcatMapView {
                     let db = store::resolve_db_dir();
                     let items = store::load_items(&db)?;
                     let positions = store::load_positions(&db)?;
-                    anyhow::Ok((items, positions))
+                    let lenses = store::load_lenses(&db)?;
+                    anyhow::Ok((items, positions, lenses))
                 })
                 .await;
             this.update(cx, |this, cx| match loaded {
-                Ok((items, positions)) => this.apply_loaded(items, positions, cx),
+                Ok((items, positions, lenses)) => {
+                    this.lenses = lenses;
+                    this.apply_loaded(items, positions, cx)
+                }
                 Err(error) => {
                     log::error!("workcat_map: load failed: {error:#}");
                     this.loading = false;
@@ -147,7 +254,20 @@ impl WorkcatMapView {
             nodes: Vec::new(),
             edges: Vec::new(),
             focused_node: None,
+            selected: HashSet::new(),
             drag: None,
+            rect_select: None,
+            field_origin: Rc::new(Cell::new(Point::default())),
+            filter: FilterState::default(),
+            search_editor,
+            lenses: BTreeMap::new(),
+            active_lens: None,
+            naming_lens: false,
+            lens_name_editor,
+            undo_stack: UndoStack::default(),
+            detail_expanded: false,
+            notes_editor,
+            notes_item: None,
             panel_focused: false,
             status: "loading workcat-db...".into(),
             loading: true,
@@ -157,7 +277,7 @@ impl WorkcatMapView {
             append_task: None,
             checkpoint_task: None,
             _load_task: load_task,
-            _focus_subscriptions: focus_subscriptions,
+            _subscriptions: subscriptions,
         }
     }
 
@@ -193,12 +313,13 @@ impl WorkcatMapView {
         cx.notify();
     }
 
-    /// Recompute visible nodes and edges from `items` + `positions`.
-    /// Nodes without a position get a deterministic grid slot, which is
-    /// then pinned into `positions` so later rebuilds keep it.
+    /// Recompute visible nodes and edges from `items` + `positions`,
+    /// gated by the current filter. Nodes without a position get a
+    /// deterministic grid slot, which is then pinned into `positions`
+    /// so later rebuilds keep it.
     fn rebuild_scene(&mut self) {
         let mut visible: Vec<usize> = (0..self.items.len())
-            .filter(|&ix| self.items[ix].status.in_default_scope())
+            .filter(|&ix| self.filter.matches(&self.items[ix]))
             .collect();
         visible.sort_by(|&a, &b| {
             let (a, b) = (&self.items[a], &self.items[b]);
@@ -244,6 +365,20 @@ impl WorkcatMapView {
         {
             self.focused_node = None;
         }
+        // Selection survives rebuilds by id; drop ids that are no
+        // longer visible so gestures never touch hidden nodes.
+        let visible_ids: HashSet<&str> = self
+            .nodes
+            .iter()
+            .map(|node| self.items[node.item_ix].id.as_str())
+            .collect();
+        self.selected.retain(|id| visible_ids.contains(id.as_str()));
+    }
+
+    fn node_ix_by_id(&self, id: &str) -> Option<usize> {
+        self.nodes
+            .iter()
+            .position(|node| self.items[node.item_ix].id == id)
     }
 
     fn focused_item(&self) -> Option<&ItemMeta> {
@@ -251,7 +386,7 @@ impl WorkcatMapView {
         self.items.get(node.item_ix)
     }
 
-    // === Drag & focus ===
+    // === Drag, selection & focus ===
 
     fn begin_drag(
         &mut self,
@@ -264,53 +399,414 @@ impl WorkcatMapView {
         let Some(node) = self.nodes.get(node_ix) else {
             return;
         };
+        let pressed_id = self.items[node.item_ix].id.clone();
+        // Dragging a selected node moves the whole selection; dragging
+        // an unselected node drops the selection and moves just it.
+        let starts: Vec<(usize, (f32, f32))> =
+            if self.selected.contains(&pressed_id) && self.selected.len() > 1 {
+                self.nodes
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, node)| self.selected.contains(&self.items[node.item_ix].id))
+                    .map(|(ix, node)| (ix, (node.x, node.y)))
+                    .collect()
+            } else {
+                self.selected.clear();
+                vec![(node_ix, (node.x, node.y))]
+            };
         self.focused_node = Some(node_ix);
+        self.sync_notes_editor(window, cx);
         self.drag = Some(DragState {
-            node_ix,
+            pressed_ix: node_ix,
             pointer_start: pointer,
-            node_start: (node.x, node.y),
+            starts,
         });
         cx.notify();
     }
 
     fn update_drag(&mut self, pointer: Point<Pixels>, cx: &mut Context<Self>) {
+        if let Some(rect) = &mut self.rect_select {
+            let origin = self.field_origin.get();
+            rect.current = (
+                f32::from(pointer.x - origin.x),
+                f32::from(pointer.y - origin.y),
+            );
+            cx.notify();
+            return;
+        }
         let Some(drag) = &self.drag else {
             return;
         };
         let dx = f32::from(pointer.x - drag.pointer_start.x);
         let dy = f32::from(pointer.y - drag.pointer_start.y);
-        let (x, y) = geometry::clamp_position(drag.node_start.0 + dx, drag.node_start.1 + dy);
-        let node_ix = drag.node_ix;
-        if let Some(node) = self.nodes.get_mut(node_ix) {
-            node.x = x;
-            node.y = y;
+        let moves: Vec<(usize, (f32, f32))> = drag
+            .starts
+            .iter()
+            .map(|&(node_ix, start)| {
+                (
+                    node_ix,
+                    geometry::clamp_position(start.0 + dx, start.1 + dy),
+                )
+            })
+            .collect();
+        for (node_ix, (x, y)) in moves {
+            if let Some(node) = self.nodes.get_mut(node_ix) {
+                node.x = x;
+                node.y = y;
+            }
         }
         cx.notify();
     }
 
-    /// Gesture rest: a real drag appends one `node_moved` event to the
-    /// log immediately (commit happens at the next checkpoint). A
+    /// Gesture rest: a real drag appends one `node_moved` event per
+    /// moved node to the log immediately (commit happens at the next
+    /// checkpoint) and records one undo step for the whole gesture. A
     /// mouse-up within the click slop is a click, which only focuses.
     fn end_drag(&mut self, cx: &mut Context<Self>) {
+        if let Some(rect) = self.rect_select.take() {
+            self.finish_rect_select(rect, cx);
+            return;
+        }
         let Some(drag) = self.drag.take() else {
             return;
         };
-        let Some(node) = self.nodes.get(drag.node_ix) else {
+        let Some(pressed) = self.nodes.get(drag.pressed_ix) else {
             return;
         };
-        if geometry::is_click(node.x - drag.node_start.0, node.y - drag.node_start.1) {
+        let pressed_start = drag
+            .starts
+            .iter()
+            .find(|(ix, _)| *ix == drag.pressed_ix)
+            .map(|&(_, start)| start)
+            .unwrap_or((pressed.x, pressed.y));
+        if geometry::is_click(pressed.x - pressed_start.0, pressed.y - pressed_start.1) {
             cx.notify();
             return;
         }
-        let item = &self.items[node.item_ix];
-        self.positions.insert(item.id.clone(), (node.x, node.y));
-        let event = store::node_moved_event(&item.id, node.x, node.y);
-        self.append_to_log(event, cx);
+        let mut op_moves = Vec::new();
+        for &(node_ix, start) in &drag.starts {
+            let Some(node) = self.nodes.get(node_ix) else {
+                continue;
+            };
+            if node.x == start.0 && node.y == start.1 {
+                continue;
+            }
+            let id = self.items[node.item_ix].id.clone();
+            let at = (node.x, node.y);
+            self.positions.insert(id.clone(), at);
+            op_moves.push((id, start, at));
+        }
+        for (id, _, (x, y)) in &op_moves {
+            let event = store::node_moved_event(id, *x, *y);
+            self.append_to_log(event, cx);
+        }
+        if !op_moves.is_empty() {
+            self.undo_stack.push(Op::Move(op_moves));
+        }
         cx.notify();
     }
 
-    fn clear_focus(&mut self, _: &ClearFocus, _window: &mut Window, cx: &mut Context<Self>) {
+    /// Background mouse-down: clear focus and start a rectangle
+    /// selection at the pointer (in field coordinates).
+    fn begin_rect_select(
+        &mut self,
+        pointer: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        window.focus(&self.focus_handle, cx);
         self.focused_node = None;
+        let origin = self.field_origin.get();
+        let at = (
+            f32::from(pointer.x - origin.x),
+            f32::from(pointer.y - origin.y),
+        );
+        self.rect_select = Some(RectSelect {
+            start: at,
+            current: at,
+        });
+        cx.notify();
+    }
+
+    fn finish_rect_select(&mut self, rect: RectSelect, cx: &mut Context<Self>) {
+        let (dx, dy) = (rect.current.0 - rect.start.0, rect.current.1 - rect.start.1);
+        if geometry::is_click(dx, dy) {
+            // A plain background click: clear the selection.
+            self.selected.clear();
+            cx.notify();
+            return;
+        }
+        let bounds = geometry::normalize_rect(rect.start, rect.current);
+        self.selected = self
+            .nodes
+            .iter()
+            .filter(|node| geometry::node_in_rect((node.x, node.y), bounds))
+            .map(|node| self.items[node.item_ix].id.clone())
+            .collect();
+        self.status = format!("{} selected", self.selected.len()).into();
+        cx.notify();
+    }
+
+    fn clear_focus(&mut self, _: &ClearFocus, window: &mut Window, cx: &mut Context<Self>) {
+        self.focused_node = None;
+        self.selected.clear();
+        self.rect_select = None;
+        self.naming_lens = false;
+        self.detail_expanded = false;
+        window.focus(&self.focus_handle, cx);
+        cx.notify();
+    }
+
+    // === Undo/redo (event-sourced compensations, DR-005 ruling 16) ===
+
+    fn undo(&mut self, _: &Undo, _window: &mut Window, cx: &mut Context<Self>) {
+        let Some(op) = self.undo_stack.undo() else {
+            self.status = "nothing to undo".into();
+            cx.notify();
+            return;
+        };
+        self.apply_op(&op, true, cx);
+        self.status = format!("undid ({} left)", self.undo_stack.undo_len()).into();
+        cx.notify();
+    }
+
+    fn redo(&mut self, _: &Redo, _window: &mut Window, cx: &mut Context<Self>) {
+        let Some(op) = self.undo_stack.redo() else {
+            self.status = "nothing to redo".into();
+            cx.notify();
+            return;
+        };
+        self.apply_op(&op, false, cx);
+        self.status = format!("redid ({} redoable)", self.undo_stack.redo_len()).into();
+        cx.notify();
+    }
+
+    /// Apply one op in the undo (`backward = true`) or redo direction
+    /// by updating local state and appending compensating events.
+    /// Unlike a fresh status change, compensations do not checkpoint;
+    /// they ride along with the next one.
+    fn apply_op(&mut self, op: &Op, backward: bool, cx: &mut Context<Self>) {
+        match op {
+            Op::Move(moves) => {
+                for (id, from, to) in moves {
+                    let (x, y) = if backward { *from } else { *to };
+                    self.positions.insert(id.clone(), (x, y));
+                    if let Some(node_ix) = self.node_ix_by_id(id)
+                        && let Some(node) = self.nodes.get_mut(node_ix)
+                    {
+                        node.x = x;
+                        node.y = y;
+                    }
+                    self.append_to_log(store::node_moved_event(id, x, y), cx);
+                }
+            }
+            Op::SetStatus(id, from, to) => {
+                let status = if backward { *from } else { *to };
+                if let Some(item) = self.items.iter_mut().find(|item| item.id == *id) {
+                    item.status = status;
+                }
+                self.append_to_log(store::status_set_event(id, status.as_str()), cx);
+                self.rebuild_scene();
+            }
+        }
+    }
+
+    // === Auto-arrange ===
+
+    /// Re-lay out the currently visible nodes on the deterministic
+    /// grid (their current sorted order), recording one undo step.
+    fn auto_arrange(&mut self, _: &AutoArrange, _window: &mut Window, cx: &mut Context<Self>) {
+        let mut op_moves = Vec::new();
+        for (slot, node_ix) in (0..self.nodes.len()).enumerate() {
+            let (x, y) = geometry::grid_position(slot);
+            let node = &mut self.nodes[node_ix];
+            if node.x == x && node.y == y {
+                continue;
+            }
+            let from = (node.x, node.y);
+            node.x = x;
+            node.y = y;
+            let item = &self.items[node.item_ix];
+            self.positions.insert(item.id.clone(), (x, y));
+            op_moves.push((item.id.clone(), from, (x, y)));
+        }
+        if op_moves.is_empty() {
+            self.status = "already arranged".into();
+            cx.notify();
+            return;
+        }
+        for (id, _, (x, y)) in &op_moves {
+            self.append_to_log(store::node_moved_event(id, *x, *y), cx);
+        }
+        self.status = format!("arranged {} nodes", op_moves.len()).into();
+        self.undo_stack.push(Op::Move(op_moves));
+        cx.notify();
+    }
+
+    // === Filters & lenses ===
+
+    fn toggle_status_filter(&mut self, status: Status, cx: &mut Context<Self>) {
+        self.filter.toggle_status(status);
+        self.active_lens = None;
+        self.rebuild_scene();
+        cx.notify();
+    }
+
+    fn clear_filter(&mut self, _: &ClearFilter, window: &mut Window, cx: &mut Context<Self>) {
+        self.filter = FilterState::default();
+        self.active_lens = None;
+        self.search_editor.update(cx, |editor, cx| {
+            editor.set_text("", window, cx);
+        });
+        self.rebuild_scene();
+        cx.notify();
+    }
+
+    fn apply_lens(&mut self, action: &ApplyLens, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(lens) = self.lenses.get(&action.name) else {
+            self.status = format!("no lens named {}", action.name).into();
+            cx.notify();
+            return;
+        };
+        self.filter = lens.to_filter();
+        let query = self.filter.query.clone();
+        self.active_lens = Some(action.name.clone());
+        self.search_editor.update(cx, |editor, cx| {
+            editor.set_text(query, window, cx);
+        });
+        // Setting editor text re-fires BufferEdited, which clears
+        // active_lens; restore it after.
+        self.active_lens = Some(action.name.clone());
+        self.rebuild_scene();
+        self.status = format!("lens: {}", action.name).into();
+        cx.notify();
+    }
+
+    fn delete_lens(&mut self, action: &DeleteLens, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.lenses.remove(&action.name).is_none() {
+            return;
+        }
+        if self.active_lens.as_deref() == Some(action.name.as_str()) {
+            self.active_lens = None;
+        }
+        self.append_to_log(store::lens_deleted_event(&action.name), cx);
+        self.status = format!("deleted lens {}", action.name).into();
+        cx.notify();
+    }
+
+    fn save_lens_prompt(
+        &mut self,
+        _: &SaveLensPrompt,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.naming_lens = true;
+        let focus = self.lens_name_editor.focus_handle(cx);
+        window.focus(&focus, cx);
+        cx.notify();
+    }
+
+    fn confirm_lens_name(
+        &mut self,
+        _: &ConfirmLensName,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let name = self.lens_name_editor.read(cx).text(cx).trim().to_string();
+        if name.is_empty() {
+            self.status = "lens needs a name".into();
+            cx.notify();
+            return;
+        }
+        let visible: Vec<&str> = ALL_STATUSES
+            .iter()
+            .filter(|status| self.filter.visible_statuses.contains(status))
+            .map(|status| status.as_str())
+            .collect();
+        let query = self.filter.query.trim().to_string();
+        self.append_to_log(store::lens_saved_event(&name, &visible, &query), cx);
+        self.lenses.insert(
+            name.clone(),
+            Lens {
+                name: name.clone(),
+                visible_statuses: visible.iter().map(|s| s.to_string()).collect(),
+                query,
+            },
+        );
+        self.active_lens = Some(name.clone());
+        self.naming_lens = false;
+        self.lens_name_editor.update(cx, |editor, cx| {
+            editor.set_text("", window, cx);
+        });
+        window.focus(&self.focus_handle, cx);
+        self.status = format!("saved lens {name}").into();
+        cx.notify();
+    }
+
+    // === Detail pane & notes ===
+
+    fn toggle_detail(&mut self, _: &ToggleDetail, window: &mut Window, cx: &mut Context<Self>) {
+        // Enter while naming a lens confirms the name instead (the
+        // single-line editor lets `enter` bubble up to this context).
+        if self.naming_lens {
+            self.confirm_lens_name(&ConfirmLensName, window, cx);
+            return;
+        }
+        if self.focused_item().is_none() {
+            self.status = "no focused item".into();
+            cx.notify();
+            return;
+        }
+        self.detail_expanded = !self.detail_expanded;
+        self.sync_notes_editor(window, cx);
+        cx.notify();
+    }
+
+    /// Keep the notes editor's text in step with the focused item.
+    fn sync_notes_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(item) = self.focused_item() else {
+            self.notes_item = None;
+            return;
+        };
+        let id = item.id.clone();
+        if self.notes_item.as_deref() == Some(id.as_str()) {
+            return;
+        }
+        let notes = item.notes().unwrap_or_default().to_string();
+        self.notes_item = Some(id);
+        self.notes_editor.update(cx, |editor, cx| {
+            editor.set_text(notes, window, cx);
+        });
+    }
+
+    /// Whole-section replace of the focused item's `## Notes` from the
+    /// notes editor (`brief_edited`, workcat-db commit 87fb2b8). The
+    /// brief file re-materializes at the next checkpoint's fold.
+    fn save_notes(&mut self, _: &SaveNotes, _window: &mut Window, cx: &mut Context<Self>) {
+        let Some(node_ix) = self.focused_node else {
+            return;
+        };
+        let item_ix = self.nodes[node_ix].item_ix;
+        let text = self.notes_editor.read(cx).text(cx).trim().to_string();
+        let item = &mut self.items[item_ix];
+        let existing = item.notes().unwrap_or_default();
+        if existing == text {
+            self.status = "notes unchanged".into();
+            cx.notify();
+            return;
+        }
+        if let Some(section) = item
+            .sections
+            .iter_mut()
+            .find(|(heading, _)| heading.eq_ignore_ascii_case("notes"))
+        {
+            section.1 = text.clone();
+        } else {
+            item.sections.push(("Notes".to_string(), text.clone()));
+        }
+        let id = item.id.clone();
+        self.append_to_log(store::brief_edited_event(&id, "Notes", &text), cx);
+        self.status = "notes saved (uncommitted)".into();
         cx.notify();
     }
 
@@ -354,8 +850,11 @@ impl WorkcatMapView {
         }
         let id = item.id.clone();
         let id8 = item.id8().to_string();
+        let previous = item.status;
         item.status = status;
-        if !status.in_default_scope() {
+        self.undo_stack
+            .push(Op::SetStatus(id.clone(), previous, status));
+        if !self.filter.visible_statuses.contains(&status) {
             self.rebuild_scene();
         }
         // Status changes checkpoint immediately (DR-006 two-grain: the
@@ -464,8 +963,64 @@ impl WorkcatMapView {
                 );
             }
             menu.separator()
+                .action("Expand Detail", Box::new(ToggleDetail))
                 .action("Checkpoint Now", Box::new(Checkpoint))
         });
+        self.show_context_menu(context_menu, position, window, cx);
+    }
+
+    /// Right-click on the background: map-wide operations. The menu
+    /// teaches the gestures (DR-003 ruling 8) by showing bindings.
+    fn deploy_background_menu(
+        &mut self,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let lens_names: Vec<String> = self.lenses.keys().cloned().collect();
+        let active_lens = self.active_lens.clone();
+        let filter_is_default = self.filter.is_default();
+        let context_menu = ContextMenu::build(window, cx, |mut menu, _, _| {
+            menu = menu
+                .context(self.focus_handle.clone())
+                .action("Auto-arrange", Box::new(AutoArrange))
+                .action("Undo", Box::new(Undo))
+                .action("Redo", Box::new(Redo))
+                .separator()
+                .header("Lenses");
+            for name in &lens_names {
+                let label = if active_lens.as_deref() == Some(name.as_str()) {
+                    format!("{name} (active)")
+                } else {
+                    name.clone()
+                };
+                menu = menu.action(label, Box::new(ApplyLens { name: name.clone() }));
+            }
+            menu = menu.action("Save Lens\u{2026}", Box::new(SaveLensPrompt));
+            if let Some(active) = &active_lens {
+                menu = menu.action(
+                    format!("Delete Lens {active}"),
+                    Box::new(DeleteLens {
+                        name: active.clone(),
+                    }),
+                );
+            }
+            if !filter_is_default {
+                menu = menu.action("Clear Filter", Box::new(ClearFilter));
+            }
+            menu.separator()
+                .action("Checkpoint Now", Box::new(Checkpoint))
+        });
+        self.show_context_menu(context_menu, position, window, cx);
+    }
+
+    fn show_context_menu(
+        &mut self,
+        context_menu: Entity<ContextMenu>,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         window.focus(&context_menu.focus_handle(cx), cx);
         let subscription = cx.subscribe_in(
             &context_menu,
@@ -501,7 +1056,7 @@ impl WorkcatMapView {
         }
     }
 
-    fn render_header(&self, cx: &Context<Self>) -> impl IntoElement {
+    fn render_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = cx.theme().colors().clone();
         h_flex()
             .w_full()
@@ -511,6 +1066,13 @@ impl WorkcatMapView {
             .border_b_1()
             .border_color(colors.border)
             .child(Label::new("Workcat Map").weight(gpui::FontWeight::BOLD))
+            .when_some(self.active_lens.clone(), |this, lens| {
+                this.child(
+                    Label::new(format!("lens: {lens}"))
+                        .size(LabelSize::Small)
+                        .color(Color::Accent),
+                )
+            })
             .when(self.pending_events > 0, |this| {
                 this.child(
                     Label::new(format!("{} uncommitted", self.pending_events))
@@ -521,45 +1083,222 @@ impl WorkcatMapView {
             .child(
                 Label::new(self.status.clone())
                     .size(LabelSize::Small)
-                    .color(Color::Muted),
+                    .color(Color::Muted)
+                    .truncate(),
             )
     }
 
-    fn render_detail_strip(&self, cx: &Context<Self>) -> Option<impl IntoElement> {
+    /// The filter row: the search editor, one toggle chip per status
+    /// (dot + visible-count), and the lens-name input while naming.
+    fn render_filter_row(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = cx.theme().colors().clone();
+        let mut counts: HashMap<Status, usize> = HashMap::new();
+        for item in &self.items {
+            *counts.entry(item.status).or_default() += 1;
+        }
+        let mut row = h_flex()
+            .w_full()
+            .px_2()
+            .py_1()
+            .gap_1()
+            .flex_wrap()
+            .border_b_1()
+            .border_color(colors.border)
+            .child(
+                div()
+                    .min_w(px(140.))
+                    .flex_grow(1.)
+                    .px_1()
+                    .rounded_sm()
+                    .border_1()
+                    .border_color(colors.border_variant)
+                    .child(self.search_editor.clone()),
+            );
+        for status in ALL_STATUSES {
+            let visible = self.filter.visible_statuses.contains(&status);
+            let count = counts.get(&status).copied().unwrap_or(0);
+            let status_color = Self::status_color(status, cx);
+            row = row.child(
+                h_flex()
+                    .id(SharedString::from(format!("chip-{}", status.as_str())))
+                    .px_1()
+                    .gap_1()
+                    .rounded_sm()
+                    .border_1()
+                    .cursor_pointer()
+                    .border_color(if visible {
+                        status_color.alpha(0.9)
+                    } else {
+                        colors.border_variant
+                    })
+                    .bg(if visible {
+                        status_color.alpha(0.15)
+                    } else {
+                        colors.element_background
+                    })
+                    .tooltip(ui::Tooltip::text(format!(
+                        "{} \u{2014} click to {}",
+                        status.label(),
+                        if visible { "hide" } else { "show" }
+                    )))
+                    .child(
+                        div()
+                            .flex_none()
+                            .w_2()
+                            .h_2()
+                            .rounded_full()
+                            .bg(status_color),
+                    )
+                    .child(
+                        Label::new(format!("{count}"))
+                            .size(LabelSize::XSmall)
+                            .color(if visible {
+                                Color::Default
+                            } else {
+                                Color::Muted
+                            }),
+                    )
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
+                            this.toggle_status_filter(status, cx);
+                            cx.stop_propagation();
+                        }),
+                    ),
+            );
+        }
+        if self.naming_lens {
+            row = row
+                .child(
+                    div()
+                        .min_w(px(120.))
+                        .px_1()
+                        .rounded_sm()
+                        .border_1()
+                        .border_color(colors.border_focused)
+                        .child(self.lens_name_editor.clone()),
+                )
+                .child(
+                    Button::new("save-lens", "Save")
+                        .label_size(LabelSize::XSmall)
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.confirm_lens_name(&ConfirmLensName, window, cx);
+                        })),
+                );
+        }
+        row
+    }
+
+    fn render_detail_strip(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
         let item = self.focused_item()?;
         let colors = cx.theme().colors().clone();
         let status_color = Self::status_color(item.status, cx);
-        Some(
-            h_flex()
-                .w_full()
-                .px_2()
-                .py_1()
-                .gap_2()
-                .border_b_1()
-                .border_color(colors.border)
-                .bg(colors.element_background)
-                .child(div().w_2().h_2().rounded_full().bg(status_color))
-                .child(
-                    Label::new(truncate_to(&item.subject, 52))
-                        .size(LabelSize::Small)
-                        .weight(gpui::FontWeight::BOLD),
-                )
-                .child(
-                    Label::new(item.status.as_str())
-                        .size(LabelSize::Small)
-                        .color(Color::Accent),
-                )
-                .child(
-                    Label::new(format!("{} deps", item.depends_on.len()))
-                        .size(LabelSize::Small)
-                        .color(Color::Muted),
-                )
-                .child(
-                    Label::new(truncate_to(&item.reference, 44))
-                        .size(LabelSize::XSmall)
-                        .color(Color::Muted),
+        let expanded = self.detail_expanded;
+        let strip = h_flex()
+            .w_full()
+            .px_2()
+            .py_1()
+            .gap_2()
+            .border_b_1()
+            .border_color(colors.border)
+            .bg(colors.element_background)
+            .id("workcat-detail-strip")
+            .cursor_pointer()
+            .tooltip(ui::Tooltip::text(if expanded {
+                "Collapse detail (enter)"
+            } else {
+                "Expand detail (enter)"
+            }))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseDownEvent, window, cx| {
+                    this.toggle_detail(&ToggleDetail, window, cx);
+                    cx.stop_propagation();
+                }),
+            )
+            .child(div().w_2().h_2().rounded_full().bg(status_color))
+            .child(
+                Label::new(truncate_to(&item.subject, 52))
+                    .size(LabelSize::Small)
+                    .weight(gpui::FontWeight::BOLD),
+            )
+            .child(
+                Label::new(item.status.as_str())
+                    .size(LabelSize::Small)
+                    .color(Color::Accent),
+            )
+            .child(
+                Label::new(format!("{} deps", item.depends_on.len()))
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
+            )
+            .child(
+                Label::new(truncate_to(&item.reference, 44))
+                    .size(LabelSize::XSmall)
+                    .color(Color::Muted),
+            );
+        Some(strip)
+    }
+
+    /// The expanded brief body: every section (State/Next/Context/
+    /// Hazards/Notes) as plain text, plus the notes editor.
+    fn render_detail_pane(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        if !self.detail_expanded {
+            return None;
+        }
+        let item = self.focused_item()?;
+        let colors = cx.theme().colors().clone();
+        let mut pane = v_flex()
+            .w_full()
+            .max_h(px(320.))
+            .px_2()
+            .py_1()
+            .gap_1()
+            .border_b_1()
+            .border_color(colors.border)
+            .bg(colors.panel_background)
+            .id("workcat-detail-pane")
+            .overflow_y_scroll();
+        for (heading, body) in &item.sections {
+            if heading.eq_ignore_ascii_case("notes") {
+                continue; // Rendered as the editable notes field below.
+            }
+            pane = pane.child(
+                Label::new(heading.clone())
+                    .size(LabelSize::Small)
+                    .weight(gpui::FontWeight::BOLD)
+                    .color(Color::Accent),
+            );
+            for line in body.lines() {
+                pane = pane.child(Label::new(line.to_string()).size(LabelSize::XSmall));
+            }
+        }
+        pane = pane
+            .child(
+                Label::new("Notes")
+                    .size(LabelSize::Small)
+                    .weight(gpui::FontWeight::BOLD)
+                    .color(Color::Accent),
+            )
+            .child(
+                div()
+                    .w_full()
+                    .px_1()
+                    .rounded_sm()
+                    .border_1()
+                    .border_color(colors.border_variant)
+                    .child(self.notes_editor.clone()),
+            )
+            .child(
+                h_flex().w_full().justify_end().child(
+                    Button::new("save-notes", "Save Notes")
+                        .label_size(LabelSize::XSmall)
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.save_notes(&SaveNotes, window, cx);
+                        })),
                 ),
-        )
+            );
+        Some(pane)
     }
 
     /// Dependency edges, drawn under the nodes: a line from each
@@ -633,11 +1372,11 @@ impl WorkcatMapView {
         let item = &self.items[node.item_ix];
         let colors = cx.theme().colors().clone();
         let status_color = Self::status_color(item.status, cx);
-        let dragging = self
-            .drag
-            .as_ref()
-            .is_some_and(|drag| drag.node_ix == node_ix);
+        let dragging = self.drag.as_ref().is_some_and(|drag| {
+            drag.pressed_ix == node_ix || drag.starts.iter().any(|(ix, _)| *ix == node_ix)
+        });
         let focused = self.focused_node == Some(node_ix);
+        let selected = self.selected.contains(&item.id);
         div()
             .absolute()
             .left(px(node.x))
@@ -660,11 +1399,13 @@ impl WorkcatMapView {
                 };
                 if focused || dragging {
                     this.border_2().border_color(colors.border_focused)
+                } else if selected {
+                    this.border_2().border_color(colors.text_accent)
                 } else {
                     this.border_1().border_color(status_color.alpha(0.8))
                 }
             })
-            .bg(if focused {
+            .bg(if focused || selected {
                 colors.element_selected
             } else {
                 colors.element_background
@@ -693,6 +1434,39 @@ impl WorkcatMapView {
                     cx.stop_propagation();
                 }),
             )
+    }
+
+    /// The in-flight selection rectangle, in field coordinates.
+    fn render_rect_select(&self, cx: &Context<Self>) -> Option<impl IntoElement> {
+        let rect = self.rect_select.as_ref()?;
+        let (min_x, min_y, max_x, max_y) = geometry::normalize_rect(rect.start, rect.current);
+        let accent = cx.theme().colors().text_accent;
+        Some(
+            div()
+                .absolute()
+                .left(px(min_x))
+                .top(px(min_y))
+                .w(px(max_x - min_x))
+                .h(px(max_y - min_y))
+                .border_1()
+                .border_color(accent)
+                .bg(accent.alpha(0.08)),
+        )
+    }
+
+    /// Captures the field content's window-space origin at paint time
+    /// so background gestures can map pointer positions into field
+    /// coordinates (the field scrolls, so this shifts per frame).
+    fn render_origin_probe(&self) -> impl IntoElement {
+        let origin = self.field_origin.clone();
+        canvas(
+            |_, _, _| (),
+            move |bounds, _, _, _| {
+                origin.set(bounds.origin);
+            },
+        )
+        .absolute()
+        .size_full()
     }
 
     /// While a drag is live, register window-level move/up handlers via
@@ -734,12 +1508,17 @@ impl WorkcatMapView {
             .h(px(geometry::FIELD_HEIGHT))
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(|this, _: &MouseDownEvent, window, cx| {
-                    this.focused_node = None;
-                    window.focus(&this.focus_handle, cx);
-                    cx.notify();
+                cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                    this.begin_rect_select(event.position, window, cx);
                 }),
             )
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                    this.deploy_background_menu(event.position, window, cx);
+                }),
+            )
+            .child(self.render_origin_probe())
             .child(self.render_edges(cx));
         if self.loading {
             content = content.child(
@@ -752,7 +1531,8 @@ impl WorkcatMapView {
             let node = self.render_node(node_ix, cx);
             content = content.child(node);
         }
-        if self.drag.is_some() {
+        content = content.children(self.render_rect_select(cx));
+        if self.drag.is_some() || self.rect_select.is_some() {
             content = content.child(self.render_drag_listener(cx));
         }
         div()
@@ -797,10 +1577,22 @@ impl Render for WorkcatMapView {
             .on_action(cx.listener(Self::set_status))
             .on_action(cx.listener(Self::checkpoint))
             .on_action(cx.listener(Self::clear_focus))
+            .on_action(cx.listener(Self::undo))
+            .on_action(cx.listener(Self::redo))
+            .on_action(cx.listener(Self::toggle_detail))
+            .on_action(cx.listener(Self::auto_arrange))
+            .on_action(cx.listener(Self::clear_filter))
+            .on_action(cx.listener(Self::apply_lens))
+            .on_action(cx.listener(Self::delete_lens))
+            .on_action(cx.listener(Self::save_lens_prompt))
+            .on_action(cx.listener(Self::confirm_lens_name))
+            .on_action(cx.listener(Self::save_notes))
             .size_full()
             .bg(cx.theme().colors().panel_background)
             .child(self.render_header(cx))
+            .child(self.render_filter_row(cx))
             .children(self.render_detail_strip(cx))
+            .children(self.render_detail_pane(cx))
             .child(self.render_field(cx))
             .children(self.context_menu.as_ref().map(|(menu, position, _)| {
                 deferred(

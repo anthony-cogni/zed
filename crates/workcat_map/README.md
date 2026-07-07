@@ -1,9 +1,14 @@
-# Workcat Map (v1)
+# Workcat Map
 
 A dock panel that renders the workcat work-item map from the workcat-db
-repo-as-database. This is v1 of the Zed-native client (workcat design
-record 005, ruling 17): read, focus, drag, set status. The history
-scrubber is not v1, but every gesture already lands in the one log.
+repo-as-database. v1 (workcat design record 005, ruling 17) was read,
+focus, drag, set status. The SPA-parity pass adds: filters + search,
+saved lenses, rect-select multi-node move, session undo/redo (200
+steps, event-sourced), auto-arrange, an expandable detail pane with
+the brief body, and notes editing (`brief_edited`, workcat-db commit
+`87fb2b8`). Table and Gantt views are permanently out of scope
+(Anthony's ruling, 2026-07-07). The full history scrubber remains
+future work; every gesture already lands in the one log.
 
 ## The four capabilities
 
@@ -33,6 +38,44 @@ complete, canceled, unknown), or right-click the node for a context
 menu carrying the same actions — the menu displays the key bindings,
 per the menus-teach-gestures principle (DR-003 ruling 8). A status
 change appends a `status_set` event and checkpoints immediately.
+
+## The parity features
+
+**Filters + search**: the filter row under the header has a search
+field (matches subject and ref, case-insensitive) and one chip per
+status showing its item count; clicking a chip toggles that status's
+visibility. The default is DR-003 ruling 7's scope (incomplete rollup
+plus unknown). `ClearFilter` (background menu) resets everything.
+
+**Saved lenses**: a lens is a named filter (statuses + query), stored
+as `lens_saved` / `lens_deleted` events in the log and folded
+last-write-wins by name. Right-click the background for the lens menu:
+apply, save the current filter (`Save Lens…`, then type a name and
+press `enter` or click Save), or delete the active lens. Deviation
+from the SPA: lenses do not save node positions — geometry is shared
+truth via `node_moved`.
+
+**Rect-select + group drag**: drag on empty background to draw a
+selection rectangle; nodes intersecting it are selected. Dragging any
+selected node moves the whole selection; one undo step covers the
+gesture. A plain background click clears the selection.
+
+**Undo/redo**: `cmd-z` / `cmd-shift-z` while the panel has focus
+(DR-005 ruling 16: pane-focus scoped, independent of Zed's editor
+history). 200 steps, covering moves (incl. group drags and
+auto-arrange) and status changes. Compensations are event-sourced:
+undo appends new events restoring the prior value — history is never
+rewritten. Undo of a status change appends without checkpointing; the
+next checkpoint carries it.
+
+**Auto-arrange**: `a` (or the background menu) re-lays the visible
+nodes out on the deterministic grid, as one undoable step.
+
+**Detail pane + notes**: `enter` (or click the detail strip) expands
+the focused item's brief body — State/Next/Context/Hazards as plain
+text — plus an editable Notes field. `Save Notes` appends a
+`brief_edited` event (whole-section replace, section `Notes`); the
+brief file re-materializes at the next checkpoint's fold.
 
 ## The write protocol
 
@@ -98,4 +141,6 @@ export WORKCAT_DB_DIR=/tmp/workcat-db-test
 cargo run -p workcat_map --example workcat_cycle -- load
 cargo run -p workcat_map --example workcat_cycle -- move <id> 240 180
 cargo run -p workcat_map --example workcat_cycle -- status <id> started
+cargo run -p workcat_map --example workcat_cycle -- lenses
+cargo run -p workcat_map --example workcat_cycle -- notes <id8>
 ```

@@ -14,6 +14,7 @@ path = "src/workcat_map.rs"
 [dependencies]
 anyhow.workspace = true
 chrono.workspace = true
+editor.workspace = true
 futures.workspace = true
 gpui.workspace = true
 gpui_platform.workspace = true

@@ -64,10 +64,10 @@ pub fn load_items(db: &Path) -> Result<Vec<ItemMeta>> {
     Ok(items)
 }
 
-/// Fold node positions from every event shard, in log order
-/// (shard dirs sorted, files sorted, lines in file order), matching
+/// Read every event shard's raw lines, in log order (shard dirs
+/// sorted, files sorted, lines in file order), matching
 /// `tools/fold.py`'s traversal.
-pub fn load_positions(db: &Path) -> Result<HashMap<String, (f32, f32)>> {
+fn read_event_lines(db: &Path) -> Result<String> {
     let ev_root = db.join("events");
     let mut text = String::new();
     let mut shards: Vec<_> = std::fs::read_dir(&ev_root)
@@ -90,7 +90,17 @@ pub fn load_positions(db: &Path) -> Result<HashMap<String, (f32, f32)>> {
             text.push('\n');
         }
     }
-    Ok(model::fold_node_positions(text.lines()))
+    Ok(text)
+}
+
+/// Fold node positions from every event shard.
+pub fn load_positions(db: &Path) -> Result<HashMap<String, (f32, f32)>> {
+    Ok(model::fold_node_positions(read_event_lines(db)?.lines()))
+}
+
+/// Fold saved lenses from every event shard.
+pub fn load_lenses(db: &Path) -> Result<std::collections::BTreeMap<String, model::Lens>> {
+    Ok(model::fold_lenses(read_event_lines(db)?.lines()))
 }
 
 fn timestamp() -> String {
@@ -115,6 +125,40 @@ pub fn status_set_event(id: &str, status: &str) -> serde_json::Value {
         "kind": "status_set",
         "id": id,
         "status": status,
+    })
+}
+
+/// Whole-section replacement of one brief section (the workcat-db
+/// `brief_edited` kind). `Notes` is a recognized section as of
+/// workcat-db commit `87fb2b8`.
+pub fn brief_edited_event(id: &str, section: &str, text: &str) -> serde_json::Value {
+    serde_json::json!({
+        "ts": timestamp(),
+        "actor": ACTOR,
+        "kind": "brief_edited",
+        "id": id,
+        "section": section,
+        "text": text,
+    })
+}
+
+pub fn lens_saved_event(name: &str, visible_statuses: &[&str], query: &str) -> serde_json::Value {
+    serde_json::json!({
+        "ts": timestamp(),
+        "actor": ACTOR,
+        "kind": "lens_saved",
+        "name": name,
+        "visible_statuses": visible_statuses,
+        "query": query,
+    })
+}
+
+pub fn lens_deleted_event(name: &str) -> serde_json::Value {
+    serde_json::json!({
+        "ts": timestamp(),
+        "actor": ACTOR,
+        "kind": "lens_deleted",
+        "name": name,
     })
 }
 
@@ -365,5 +409,27 @@ mod tests {
         assert_eq!(ev["kind"], "node_moved");
         assert_eq!(ev["x"], 1.5);
         assert_eq!(ev["y"], 2.5);
+        let ev = brief_edited_event("some-id", "Notes", "note body");
+        assert_eq!(ev["kind"], "brief_edited");
+        assert_eq!(ev["section"], "Notes");
+        assert_eq!(ev["text"], "note body");
+        let ev = lens_saved_event("mine", &["started", "blocked"], "eda");
+        assert_eq!(ev["kind"], "lens_saved");
+        assert_eq!(ev["name"], "mine");
+        assert_eq!(ev["visible_statuses"][1], "blocked");
+        assert_eq!(ev["query"], "eda");
+        let ev = lens_deleted_event("mine");
+        assert_eq!(ev["kind"], "lens_deleted");
+    }
+
+    #[test]
+    fn lenses_round_trip_through_the_log() {
+        let dir = tempfile::tempdir().unwrap();
+        append_event(dir.path(), &lens_saved_event("a", &["started"], "")).unwrap();
+        append_event(dir.path(), &lens_saved_event("b", &["blocked"], "q")).unwrap();
+        append_event(dir.path(), &lens_deleted_event("a")).unwrap();
+        let lenses = load_lenses(dir.path()).unwrap();
+        assert_eq!(lenses.len(), 1);
+        assert_eq!(lenses["b"].query, "q");
     }
 }

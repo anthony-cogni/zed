@@ -50,6 +50,18 @@ pub fn is_click(dx: f32, dy: f32) -> bool {
     dx.abs() <= CLICK_SLOP && dy.abs() <= CLICK_SLOP
 }
 
+/// Normalize two drag corners into `(min_x, min_y, max_x, max_y)`.
+pub fn normalize_rect(a: (f32, f32), b: (f32, f32)) -> (f32, f32, f32, f32) {
+    (a.0.min(b.0), a.1.min(b.1), a.0.max(b.0), a.1.max(b.1))
+}
+
+/// Whether a node (top-left `pos`, standard node size) intersects the
+/// normalized selection rectangle.
+pub fn node_in_rect(pos: (f32, f32), rect: (f32, f32, f32, f32)) -> bool {
+    let (min_x, min_y, max_x, max_y) = rect;
+    pos.0 < max_x && pos.0 + NODE_WIDTH > min_x && pos.1 < max_y && pos.1 + NODE_HEIGHT > min_y
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -88,5 +100,27 @@ mod tests {
         assert!(is_click(-3.0, 3.0));
         assert!(!is_click(4.0, 0.0));
         assert!(!is_click(0.0, -10.0));
+    }
+
+    #[test]
+    fn rect_normalizes_any_corner_order() {
+        assert_eq!(
+            normalize_rect((10.0, 20.0), (5.0, 40.0)),
+            (5.0, 20.0, 10.0, 40.0)
+        );
+        assert_eq!(normalize_rect((0.0, 0.0), (3.0, 4.0)), (0.0, 0.0, 3.0, 4.0));
+    }
+
+    #[test]
+    fn node_rect_intersection() {
+        let rect = (100.0, 100.0, 300.0, 200.0);
+        // Fully inside.
+        assert!(node_in_rect((120.0, 120.0), rect));
+        // Overlapping the left edge (node extends into the rect).
+        assert!(node_in_rect((100.0 - NODE_WIDTH + 1.0, 150.0), rect));
+        // Entirely left of the rect.
+        assert!(!node_in_rect((100.0 - NODE_WIDTH - 1.0, 150.0), rect));
+        // Entirely below.
+        assert!(!node_in_rect((150.0, 201.0), rect));
     }
 }

@@ -1,9 +1,10 @@
 //! Pure core: workcat item model, brief metadata parsing, the default
-//! map scope, and the position fold over `node_moved` events.
+//! map scope, filters, lenses, the undo stack, and the position fold
+//! over `node_moved` events.
 //!
 //! No IO and no GPUI types live here, so everything is unit-testable.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 /// The workcat status vocabulary (workcat-db README).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -102,11 +103,202 @@ pub struct ItemMeta {
     pub status: Status,
     /// Dependencies as id8 prefixes (first 8 hex digits of the dep uuid).
     pub depends_on: Vec<String>,
+    /// Brief body sections in file order: (heading, body text).
+    /// Includes `Notes` when present (workcat-db commit 87fb2b8).
+    pub sections: Vec<(String, String)>,
+}
+
+impl ItemMeta {
+    /// The `## Notes` section body, if the brief has one.
+    pub fn notes(&self) -> Option<&str> {
+        self.sections
+            .iter()
+            .find(|(heading, _)| heading.eq_ignore_ascii_case("notes"))
+            .map(|(_, body)| body.as_str())
+    }
 }
 
 impl ItemMeta {
     pub fn id8(&self) -> &str {
         &self.id[..self.id.len().min(8)]
+    }
+}
+
+/// The visibility filter over the map: which statuses show, plus a
+/// free-text query matched against subject and ref (case-insensitive).
+/// The default matches DR-003 ruling 7: the incomplete rollup plus
+/// `unknown`; terminal statuses hidden.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FilterState {
+    pub visible_statuses: HashSet<Status>,
+    pub query: String,
+}
+
+impl Default for FilterState {
+    fn default() -> Self {
+        Self {
+            visible_statuses: ALL_STATUSES
+                .into_iter()
+                .filter(|status| status.in_default_scope())
+                .collect(),
+            query: String::new(),
+        }
+    }
+}
+
+impl FilterState {
+    pub fn matches(&self, item: &ItemMeta) -> bool {
+        if !self.visible_statuses.contains(&item.status) {
+            return false;
+        }
+        let query = self.query.trim();
+        if query.is_empty() {
+            return true;
+        }
+        let query = query.to_lowercase();
+        item.subject.to_lowercase().contains(&query)
+            || item.reference.to_lowercase().contains(&query)
+    }
+
+    pub fn toggle_status(&mut self, status: Status) {
+        if !self.visible_statuses.remove(&status) {
+            self.visible_statuses.insert(status);
+        }
+    }
+
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// A saved lens: a named filter (DR-001's lensed map). Folded from
+/// `lens_saved` / `lens_deleted` events, last-write-wins per name.
+/// Positions are deliberately NOT part of a lens here (deviation from
+/// the SPA): node geometry is shared truth via `node_moved` events.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Lens {
+    pub name: String,
+    pub visible_statuses: Vec<String>,
+    pub query: String,
+}
+
+impl Lens {
+    pub fn to_filter(&self) -> FilterState {
+        FilterState {
+            visible_statuses: self
+                .visible_statuses
+                .iter()
+                .filter_map(|s| Status::parse(s))
+                .collect(),
+            query: self.query.clone(),
+        }
+    }
+}
+
+/// Fold `lens_saved`/`lens_deleted` events (last-write-wins per lens
+/// name) from raw JSON-lines, the same shape as the position fold.
+pub fn fold_lenses<'a>(lines: impl Iterator<Item = &'a str>) -> BTreeMap<String, Lens> {
+    let mut lenses = BTreeMap::new();
+    for line in lines {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        match value.get("kind").and_then(|k| k.as_str()) {
+            Some("lens_saved") => {
+                let Some(name) = value.get("name").and_then(|v| v.as_str()) else {
+                    continue;
+                };
+                let visible_statuses = value
+                    .get("visible_statuses")
+                    .and_then(|v| v.as_array())
+                    .map(|entries| {
+                        entries
+                            .iter()
+                            .filter_map(|s| s.as_str().map(str::to_string))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let query = value
+                    .get("query")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                lenses.insert(
+                    name.to_string(),
+                    Lens {
+                        name: name.to_string(),
+                        visible_statuses,
+                        query,
+                    },
+                );
+            }
+            Some("lens_deleted") => {
+                if let Some(name) = value.get("name").and_then(|v| v.as_str()) {
+                    lenses.remove(name);
+                }
+            }
+            _ => {}
+        }
+    }
+    lenses
+}
+
+/// One undoable operation. Compensations are event-sourced: undoing
+/// appends new events restoring the prior value; history is never
+/// rewritten (DR-005 ruling 16: workcat undo is pane-focus scoped and
+/// independent of Zed's editor history).
+#[derive(Debug, Clone, PartialEq)]
+pub enum Op {
+    /// One gesture's node moves (a single drag or a group drag or an
+    /// auto-arrange): `(id, from, to)` per node.
+    Move(Vec<(String, (f32, f32), (f32, f32))>),
+    /// A status change: `(id, from, to)`.
+    SetStatus(String, Status, Status),
+}
+
+/// A bounded undo/redo stack (200 steps, matching the SPA).
+#[derive(Debug, Default)]
+pub struct UndoStack {
+    undo: Vec<Op>,
+    redo: Vec<Op>,
+}
+
+pub const UNDO_CAPACITY: usize = 200;
+
+impl UndoStack {
+    /// Record a newly-performed operation.
+    pub fn push(&mut self, op: Op) {
+        self.redo.clear();
+        self.undo.push(op);
+        if self.undo.len() > UNDO_CAPACITY {
+            self.undo.remove(0);
+        }
+    }
+
+    /// Pop the most recent op for undoing; the caller applies the
+    /// compensation, then the op moves to the redo side.
+    pub fn undo(&mut self) -> Option<Op> {
+        let op = self.undo.pop()?;
+        self.redo.push(op.clone());
+        Some(op)
+    }
+
+    pub fn redo(&mut self) -> Option<Op> {
+        let op = self.redo.pop()?;
+        self.undo.push(op.clone());
+        Some(op)
+    }
+
+    pub fn undo_len(&self) -> usize {
+        self.undo.len()
+    }
+
+    pub fn redo_len(&self) -> usize {
+        self.redo.len()
     }
 }
 
@@ -131,16 +323,29 @@ pub fn parse_brief(text: &str) -> Option<ItemMeta> {
     let mut status = None;
     let mut depends_on = Vec::new();
     let mut in_depends = false;
+    let mut in_sections = false;
+    let mut sections: Vec<(String, String)> = Vec::new();
     for line in text.lines() {
+        if let Some(heading) = line.strip_prefix("## ") {
+            // Metadata block is over once brief sections begin.
+            in_sections = true;
+            sections.push((heading.trim().to_string(), String::new()));
+            continue;
+        }
+        if in_sections {
+            if let Some((_, body)) = sections.last_mut() {
+                if !body.is_empty() {
+                    body.push('\n');
+                }
+                body.push_str(line);
+            }
+            continue;
+        }
         if let Some(rest) = line.strip_prefix("# ") {
             if subject.is_none() {
                 subject = Some(rest.trim().to_string());
             }
             continue;
-        }
-        if line.starts_with("## ") {
-            // Metadata block is over once brief sections begin.
-            break;
         }
         if in_depends {
             if let Some(entry) = line.strip_prefix("  - ") {
@@ -162,12 +367,17 @@ pub fn parse_brief(text: &str) -> Option<ItemMeta> {
             in_depends = true;
         }
     }
+    for (_, body) in &mut sections {
+        let trimmed = body.trim();
+        *body = trimmed.to_string();
+    }
     Some(ItemMeta {
         id: id?,
         subject: subject?,
         reference: reference?,
         status: status?,
         depends_on,
+        sections,
     })
 }
 
@@ -244,9 +454,26 @@ Not started.
                 reference: "agent_notes/2026-07-06/workcat-substrate-bootstrap-HANDOFF.md".into(),
                 status: Status::NotStarted,
                 depends_on: vec!["e89113a0".into()],
+                sections: vec![
+                    ("State".into(), "Not started.".into()),
+                    (
+                        "Next".into(),
+                        "- id: not-a-real-id (must not be parsed; sections are past the block)"
+                            .into()
+                    ),
+                ],
             }
         );
         assert_eq!(item.id8(), "8b0ce58d");
+    }
+
+    #[test]
+    fn parses_notes_section() {
+        let text = "# S\n\n- id: abc\n- ref: r\n- status: started\n- depends_on: []\n\n\
+            ## State\n\nGoing.\n\n## Notes\n\nA note line.\nSecond line.\n";
+        let item = parse_brief(text).unwrap();
+        assert_eq!(item.notes(), Some("A note line.\nSecond line."));
+        assert_eq!(item.sections.len(), 2);
     }
 
     #[test]
@@ -301,6 +528,97 @@ Not started.
                 Status::Unknown,
             ]
         );
+    }
+
+    fn item(subject: &str, reference: &str, status: Status) -> ItemMeta {
+        ItemMeta {
+            id: format!("{subject}-id"),
+            subject: subject.into(),
+            reference: reference.into(),
+            status,
+            depends_on: Vec::new(),
+            sections: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn default_filter_matches_default_scope() {
+        let filter = FilterState::default();
+        assert!(filter.is_default());
+        assert!(filter.matches(&item("a", "r", Status::Started)));
+        assert!(filter.matches(&item("a", "r", Status::Unknown)));
+        assert!(!filter.matches(&item("a", "r", Status::Complete)));
+        assert!(!filter.matches(&item("a", "r", Status::Canceled)));
+    }
+
+    #[test]
+    fn filter_query_matches_subject_and_ref_case_insensitive() {
+        let mut filter = FilterState::default();
+        filter.query = "CONNECTOR".into();
+        assert!(filter.matches(&item("Fix the eda connector", "r", Status::Started)));
+        assert!(filter.matches(&item("a", "notes/connector-fix.md", Status::Started)));
+        assert!(!filter.matches(&item("unrelated", "r", Status::Started)));
+        filter.query = "  ".into();
+        assert!(filter.matches(&item("anything", "r", Status::Started)));
+    }
+
+    #[test]
+    fn filter_toggle_status_round_trips() {
+        let mut filter = FilterState::default();
+        filter.toggle_status(Status::Complete);
+        assert!(filter.matches(&item("a", "r", Status::Complete)));
+        assert!(!filter.is_default());
+        filter.toggle_status(Status::Complete);
+        assert!(!filter.matches(&item("a", "r", Status::Complete)));
+        assert!(filter.is_default());
+    }
+
+    #[test]
+    fn lenses_fold_last_write_wins_and_delete() {
+        let lines = [
+            r#"{"kind":"lens_saved","name":"blocked","visible_statuses":["blocked"],"query":""}"#,
+            r#"{"kind":"lens_saved","name":"eda","visible_statuses":["started","paused"],"query":"eda"}"#,
+            r#"{"kind":"node_moved","id":"x","x":1,"y":2}"#,
+            r#"{"kind":"lens_saved","name":"blocked","visible_statuses":["blocked","paused"],"query":"q"}"#,
+            r#"{"kind":"lens_deleted","name":"eda"}"#,
+            "garbage",
+        ];
+        let lenses = fold_lenses(lines.into_iter());
+        assert_eq!(lenses.len(), 1);
+        let lens = &lenses["blocked"];
+        assert_eq!(lens.visible_statuses, vec!["blocked", "paused"]);
+        assert_eq!(lens.query, "q");
+        let filter = lens.to_filter();
+        assert!(filter.visible_statuses.contains(&Status::Blocked));
+        assert!(filter.visible_statuses.contains(&Status::Paused));
+        assert_eq!(filter.visible_statuses.len(), 2);
+    }
+
+    #[test]
+    fn undo_stack_round_trips_and_caps() {
+        let mut stack = UndoStack::default();
+        let move_op = Op::Move(vec![("id-a".into(), (0.0, 0.0), (5.0, 5.0))]);
+        let status_op = Op::SetStatus("id-a".into(), Status::Started, Status::Merged);
+        stack.push(move_op.clone());
+        stack.push(status_op.clone());
+        assert_eq!(stack.undo(), Some(status_op.clone()));
+        assert_eq!(stack.redo(), Some(status_op.clone()));
+        assert_eq!(stack.undo(), Some(status_op));
+        assert_eq!(stack.undo(), Some(move_op.clone()));
+        assert_eq!(stack.undo(), None);
+        assert_eq!(stack.redo_len(), 2);
+        // A new push clears redo.
+        stack.push(move_op);
+        assert_eq!(stack.redo_len(), 0);
+        // Capacity: oldest entries fall off.
+        for i in 0..(UNDO_CAPACITY + 10) {
+            stack.push(Op::SetStatus(
+                format!("id-{i}"),
+                Status::Started,
+                Status::Paused,
+            ));
+        }
+        assert_eq!(stack.undo_len(), UNDO_CAPACITY);
     }
 
     #[test]
