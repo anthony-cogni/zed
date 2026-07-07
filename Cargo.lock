@@ -22524,6 +22524,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "workcat_map"
+version = "0.1.0"
+dependencies = [
+ "agent_mission_control",
+ "anyhow",
+ "chrono",
+ "gpui",
+ "gpui_platform",
+ "log",
+ "paths",
+ "pretty_assertions",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "ui",
+ "workspace",
+]
+
+[[package]]
 name = "workspace"
 version = "0.1.0"
 dependencies = [
@@ -23181,6 +23200,7 @@ dependencies = [
  "which_key",
  "windows 0.61.3",
  "windows_resources",
+ "workcat_map",
  "workspace",
  "zed-reqwest",
  "zed_actions",
