@@ -22527,16 +22527,18 @@ dependencies = [
 name = "workcat_map"
 version = "0.1.0"
 dependencies = [
- "agent_mission_control",
  "anyhow",
  "chrono",
+ "futures 0.3.32",
  "gpui",
  "gpui_platform",
  "log",
  "paths",
  "pretty_assertions",
+ "schemars 1.0.4",
  "serde",
  "serde_json",
+ "smol",
  "tempfile",
  "ui",
  "workspace",

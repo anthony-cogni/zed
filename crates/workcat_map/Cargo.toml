@@ -12,18 +12,23 @@ workspace = true
 path = "src/workcat_map.rs"
 
 [dependencies]
-agent_mission_control.workspace = true
 anyhow.workspace = true
 chrono.workspace = true
+futures.workspace = true
 gpui.workspace = true
 gpui_platform.workspace = true
 log.workspace = true
 paths.workspace = true
+schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+smol.workspace = true
 ui.workspace = true
 workspace.workspace = true
 
 [dev-dependencies]
 pretty_assertions.workspace = true
 tempfile.workspace = true
+
+[[example]]
+name = "workcat_cycle"

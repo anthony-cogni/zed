@@ -1685,4 +1685,20 @@
       "shift-tab": "skill_creator::FocusPreviousField",
     },
   },
+  {
+    "context": "WorkcatMap",
+    "bindings": {
+      "1": ["workcat_map::SetStatus", { "status": "not_started" }],
+      "2": ["workcat_map::SetStatus", { "status": "started" }],
+      "3": ["workcat_map::SetStatus", { "status": "paused" }],
+      "4": ["workcat_map::SetStatus", { "status": "blocked" }],
+      "5": ["workcat_map::SetStatus", { "status": "implemented" }],
+      "6": ["workcat_map::SetStatus", { "status": "merged" }],
+      "7": ["workcat_map::SetStatus", { "status": "complete" }],
+      "8": ["workcat_map::SetStatus", { "status": "canceled" }],
+      "9": ["workcat_map::SetStatus", { "status": "unknown" }],
+      "c": "workcat_map::Checkpoint",
+      "escape": "workcat_map::ClearFocus",
+    },
+  },
 ]
