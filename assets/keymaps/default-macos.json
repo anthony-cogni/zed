@@ -1699,6 +1699,8 @@
       "9": ["workcat_map::SetStatus", { "status": "unknown" }],
       "c": "workcat_map::Checkpoint",
       "a": "workcat_map::AutoArrange",
+      "s": "workcat_map::Squeeze",
+      "f": "workcat_map::Fit",
       "enter": "workcat_map::ToggleDetail",
       "cmd-z": "workcat_map::Undo",
       "cmd-shift-z": "workcat_map::Redo",

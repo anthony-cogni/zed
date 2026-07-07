@@ -159,93 +159,111 @@ impl WorkcatDetailView {
                 .into_any_element();
         };
         let status_color = WorkcatMapView::status_color(item.status, cx);
+        // Readability: body copy at the default UI size (never below),
+        // a bounded measure (~70ch at the UI font), 1.5-ish line
+        // rhythm via per-line padding, and clear space above each
+        // section heading so the layer-cake scans.
+        let measure = px(560.);
         let mut body = v_flex()
             .id("workcat-detail-body")
             .size_full()
-            .p_2()
+            .p_3()
             .gap_1()
             .overflow_y_scroll()
             .child(
-                Label::new(item.subject.clone())
-                    .weight(gpui::FontWeight::BOLD)
-                    .size(LabelSize::Default),
+                div().max_w(measure).child(
+                    Label::new(item.subject.clone())
+                        .weight(gpui::FontWeight::BOLD)
+                        .size(LabelSize::Large),
+                ),
             )
             .child(
                 h_flex()
                     .gap_2()
+                    .pt_1()
                     .child(
                         div()
                             .flex_none()
-                            .w_2()
-                            .h_2()
+                            .w_2p5()
+                            .h_2p5()
                             .rounded_full()
                             .bg(status_color),
                     )
                     .child(
                         Label::new(item.status.as_str())
-                            .size(LabelSize::Small)
-                            .color(Color::Accent),
+                            .color(Color::Accent)
+                            .weight(gpui::FontWeight::MEDIUM),
                     )
                     .child(
-                        Label::new(format!("{} deps", item.depends_on.len()))
-                            .size(LabelSize::Small)
-                            .color(Color::Muted),
+                        Label::new(format!("{} deps", item.depends_on.len())).color(Color::Muted),
                     )
-                    .child(
-                        Label::new(item.id8().to_string())
-                            .size(LabelSize::Small)
-                            .color(Color::Muted),
-                    ),
+                    .child(Label::new(item.id8().to_string()).color(Color::Muted)),
             )
             .child(
                 Label::new(item.reference.clone())
-                    .size(LabelSize::XSmall)
+                    .size(LabelSize::Small)
                     .color(Color::Muted),
-            )
-            .child(div().h_1());
+            );
         for (heading, section_body) in &item.sections {
             if heading.eq_ignore_ascii_case("notes") {
                 continue; // Rendered as the editable field below.
             }
             body = body.child(
-                Label::new(heading.clone())
-                    .size(LabelSize::Small)
-                    .weight(gpui::FontWeight::BOLD)
-                    .color(Color::Accent),
+                div().pt_4().pb_1().child(
+                    Label::new(heading.to_uppercase())
+                        .size(LabelSize::Small)
+                        .weight(gpui::FontWeight::BOLD)
+                        .color(Color::Accent),
+                ),
             );
             for line in section_body.lines() {
-                body = body.child(Label::new(line.to_string()).size(LabelSize::XSmall));
+                if line.trim().is_empty() {
+                    body = body.child(div().h_2());
+                    continue;
+                }
+                body = body.child(
+                    div()
+                        .max_w(measure)
+                        .py_0p5()
+                        .child(Label::new(line.to_string())),
+                );
             }
-            body = body.child(div().h_1());
         }
         body = body
             .child(
-                Label::new("Notes")
-                    .size(LabelSize::Small)
-                    .weight(gpui::FontWeight::BOLD)
-                    .color(Color::Accent),
+                div().pt_4().pb_1().child(
+                    Label::new("NOTES")
+                        .size(LabelSize::Small)
+                        .weight(gpui::FontWeight::BOLD)
+                        .color(Color::Accent),
+                ),
             )
             .child(
                 div()
                     .w_full()
-                    .px_1()
-                    .rounded_sm()
+                    .max_w(measure)
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
                     .border_1()
                     .border_color(colors.border_variant)
+                    .bg(colors.editor_background)
                     .child(self.notes_editor.clone()),
             )
             .child(
                 h_flex()
                     .w_full()
+                    .max_w(measure)
+                    .pt_1()
                     .justify_between()
                     .child(
                         Label::new(self.status.clone())
-                            .size(LabelSize::XSmall)
+                            .size(LabelSize::Small)
                             .color(Color::Muted),
                     )
                     .child(
                         Button::new("save-notes", "Save Notes")
-                            .label_size(LabelSize::XSmall)
+                            .label_size(LabelSize::Small)
                             .on_click(cx.listener(|this, _, _window, cx| {
                                 this.save_notes(cx);
                             })),

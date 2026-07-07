@@ -25,8 +25,8 @@ use futures::StreamExt as _;
 use gpui::{
     App, AsyncWindowContext, Context, DismissEvent, DispatchPhase, Entity, EventEmitter,
     FocusHandle, Focusable, Hsla, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    PathBuilder, Pixels, Point, SharedString, Subscription, Task, WeakEntity, Window, actions,
-    anchored, canvas, deferred, point, px,
+    PathBuilder, Pixels, Point, ScrollHandle, SharedString, Subscription, Task, WeakEntity, Window,
+    actions, anchored, canvas, deferred, point, px,
 };
 use ui::{ContextMenu, prelude::*};
 use workspace::{
@@ -59,6 +59,11 @@ actions!(
         ToggleDetail,
         /// Re-lays out the visible nodes on the deterministic grid.
         AutoArrange,
+        /// Packs connected components into a compact, viewport-shaped
+        /// layout (the SPA's "squeeze"), persisted as node moves.
+        Squeeze,
+        /// Scrolls the field so the visible nodes are in view.
+        Fit,
         /// Resets filters and search to the default scope.
         ClearFilter,
         /// Starts naming a lens to save the current filter as.
@@ -102,7 +107,7 @@ impl gpui::Global for WorkcatMapHandle {}
 
 const WORKCAT_MAP_PANEL_KEY: &str = "WorkcatMapPanel";
 const DEFAULT_WIDTH: f32 = 640.;
-const MAX_LABEL_CHARS: usize = 21;
+const MAX_LABEL_CHARS: usize = 22;
 
 pub fn init(cx: &mut App) {
     cx.observe_new(|workspace: &mut Workspace, _, _| {
@@ -157,6 +162,9 @@ pub struct WorkcatMapView {
     /// The field content's window-space origin, captured at paint time
     /// so background gestures can be mapped into field coordinates.
     field_origin: Rc<Cell<Point<Pixels>>>,
+    /// Scroll state of the field viewport (drives Fit and gives
+    /// Squeeze its viewport aspect).
+    scroll_handle: ScrollHandle,
     /// The visibility filter (statuses + free-text query).
     filter: FilterState,
     search_editor: Entity<Editor>,
@@ -257,6 +265,7 @@ impl WorkcatMapView {
             drag: None,
             rect_select: None,
             field_origin: Rc::new(Cell::new(Point::default())),
+            scroll_handle: ScrollHandle::new(),
             filter: FilterState::default(),
             search_editor,
             lenses: BTreeMap::new(),
@@ -605,15 +614,105 @@ impl WorkcatMapView {
         }
     }
 
-    // === Auto-arrange ===
+    // === Layout verbs: auto-arrange, squeeze, fit ===
 
     /// Re-lay out the currently visible nodes on the deterministic
     /// grid (their current sorted order), recording one undo step.
     fn auto_arrange(&mut self, _: &AutoArrange, _window: &mut Window, cx: &mut Context<Self>) {
+        let mut targets = Vec::with_capacity(self.nodes.len());
+        for slot in 0..self.nodes.len() {
+            targets.push((slot, geometry::grid_position(slot)));
+        }
+        let moved = self.apply_layout(&targets, cx);
+        self.status = if moved == 0 {
+            "already arranged".into()
+        } else {
+            format!("arranged {moved} nodes").into()
+        };
+        cx.notify();
+    }
+
+    /// The SPA's "squeeze": treat each connected component of the
+    /// visible graph as a rigid block (preserving your arrangement
+    /// inside it) and shelf-pack the blocks into a compact layout
+    /// whose aspect roughly matches the viewport. Persisted as
+    /// ordinary node moves, so it composes with manual nudges and is
+    /// one undo step.
+    fn squeeze(&mut self, _: &Squeeze, window: &mut Window, cx: &mut Context<Self>) {
+        if self.nodes.is_empty() {
+            self.status = "nothing to squeeze".into();
+            cx.notify();
+            return;
+        }
+        let components = geometry::connected_components(self.nodes.len(), &self.edges);
+        let blocks: Vec<geometry::Block> = components
+            .iter()
+            .map(|members| {
+                let positions: Vec<(f32, f32)> = members
+                    .iter()
+                    .map(|&ix| (self.nodes[ix].x, self.nodes[ix].y))
+                    .collect();
+                let (min_x, min_y, max_x, max_y) =
+                    geometry::nodes_bbox(&positions).expect("non-empty component");
+                geometry::Block {
+                    w: max_x - min_x,
+                    h: max_y - min_y,
+                    members: members
+                        .iter()
+                        .map(|&ix| (ix, self.nodes[ix].x - min_x, self.nodes[ix].y - min_y))
+                        .collect(),
+                }
+            })
+            .collect();
+        let viewport = self.scroll_handle.bounds().size;
+        let aspect = if viewport.height > px(0.) {
+            f32::from(viewport.width) / f32::from(viewport.height)
+        } else {
+            1.0
+        };
+        let packed = geometry::pack_blocks(&blocks, aspect);
+        let mut targets = Vec::new();
+        for (block, &(bx, by)) in blocks.iter().zip(&packed) {
+            for &(node_ix, dx, dy) in &block.members {
+                targets.push((node_ix, geometry::clamp_position(bx + dx, by + dy)));
+            }
+        }
+        let moved = self.apply_layout(&targets, cx);
+        self.status = if moved == 0 {
+            "already packed".into()
+        } else {
+            format!("squeezed {} blocks ({moved} nodes)", blocks.len()).into()
+        };
+        self.fit(&Fit, window, cx);
+    }
+
+    /// Scroll the field so the visible nodes' bounding box starts in
+    /// view (the panel has no zoom; squeeze is the "make it all fit"
+    /// half, fit is the "take me there" half).
+    fn fit(&mut self, _: &Fit, _window: &mut Window, cx: &mut Context<Self>) {
+        let positions: Vec<(f32, f32)> = self.nodes.iter().map(|node| (node.x, node.y)).collect();
+        let Some((min_x, min_y, _, _)) = geometry::nodes_bbox(&positions) else {
+            self.status = "nothing to fit".into();
+            cx.notify();
+            return;
+        };
+        // Offsets grow negative as content scrolls up/left.
+        self.scroll_handle.set_offset(point(
+            px(-(min_x - geometry::GRID_MARGIN).max(0.0)),
+            px(-(min_y - geometry::GRID_MARGIN).max(0.0)),
+        ));
+        cx.notify();
+    }
+
+    /// Apply `(node_ix, target)` moves as one undoable operation,
+    /// appending a `node_moved` event per changed node. Returns how
+    /// many nodes actually moved.
+    fn apply_layout(&mut self, targets: &[(usize, (f32, f32))], cx: &mut Context<Self>) -> usize {
         let mut op_moves = Vec::new();
-        for (slot, node_ix) in (0..self.nodes.len()).enumerate() {
-            let (x, y) = geometry::grid_position(slot);
-            let node = &mut self.nodes[node_ix];
+        for &(node_ix, (x, y)) in targets {
+            let Some(node) = self.nodes.get_mut(node_ix) else {
+                continue;
+            };
             if node.x == x && node.y == y {
                 continue;
             }
@@ -624,17 +723,14 @@ impl WorkcatMapView {
             self.positions.insert(item.id.clone(), (x, y));
             op_moves.push((item.id.clone(), from, (x, y)));
         }
-        if op_moves.is_empty() {
-            self.status = "already arranged".into();
-            cx.notify();
-            return;
-        }
+        let moved = op_moves.len();
         for (id, _, (x, y)) in &op_moves {
             self.append_to_log(store::node_moved_event(id, *x, *y), cx);
         }
-        self.status = format!("arranged {} nodes", op_moves.len()).into();
-        self.undo_stack.push(Op::Move(op_moves));
-        cx.notify();
+        if !op_moves.is_empty() {
+            self.undo_stack.push(Op::Move(op_moves));
+        }
+        moved
     }
 
     // === Filters & lenses ===
@@ -955,6 +1051,8 @@ impl WorkcatMapView {
         let context_menu = ContextMenu::build(window, cx, |mut menu, _, _| {
             menu = menu
                 .context(self.focus_handle.clone())
+                .action("Fit", Box::new(Fit))
+                .action("Squeeze", Box::new(Squeeze))
                 .action("Auto-arrange", Box::new(AutoArrange))
                 .action("Undo", Box::new(Undo))
                 .action("Redo", Box::new(Redo))
@@ -1071,20 +1169,32 @@ impl WorkcatMapView {
         let mut row = h_flex()
             .w_full()
             .px_2()
-            .py_1()
-            .gap_1()
+            .py_1p5()
+            .gap_2()
             .flex_wrap()
             .border_b_1()
             .border_color(colors.border)
             .child(
                 div()
-                    .min_w(px(140.))
+                    .min_w(px(160.))
                     .flex_grow(1.)
-                    .px_1()
-                    .rounded_sm()
+                    .px_1p5()
+                    .py_0p5()
+                    .rounded_md()
                     .border_1()
                     .border_color(colors.border_variant)
+                    .bg(colors.editor_background)
                     .child(self.search_editor.clone()),
+            )
+            .child(
+                Button::new("lenses", "Lenses")
+                    .label_size(LabelSize::Small)
+                    .tooltip(ui::Tooltip::text(
+                        "Saved lenses (also: right-click the map)",
+                    ))
+                    .on_click(cx.listener(|this, event: &gpui::ClickEvent, window, cx| {
+                        this.deploy_background_menu(event.position(), window, cx);
+                    })),
             );
         for status in ALL_STATUSES {
             let visible = self.filter.visible_statuses.contains(&status);
@@ -1093,9 +1203,10 @@ impl WorkcatMapView {
             row = row.child(
                 h_flex()
                     .id(SharedString::from(format!("chip-{}", status.as_str())))
-                    .px_1()
-                    .gap_1()
-                    .rounded_sm()
+                    .px_1p5()
+                    .py_0p5()
+                    .gap_1p5()
+                    .rounded_md()
                     .border_1()
                     .cursor_pointer()
                     .border_color(if visible {
@@ -1121,15 +1232,13 @@ impl WorkcatMapView {
                             .rounded_full()
                             .bg(status_color),
                     )
-                    .child(
-                        Label::new(format!("{count}"))
-                            .size(LabelSize::XSmall)
-                            .color(if visible {
-                                Color::Default
-                            } else {
-                                Color::Muted
-                            }),
-                    )
+                    .child(Label::new(format!("{count}")).size(LabelSize::Small).color(
+                        if visible {
+                            Color::Default
+                        } else {
+                            Color::Muted
+                        },
+                    ))
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
@@ -1184,11 +1293,7 @@ impl WorkcatMapView {
                 }),
             )
             .child(div().w_2().h_2().rounded_full().bg(status_color))
-            .child(
-                Label::new(truncate_to(&item.subject, 52))
-                    .size(LabelSize::Small)
-                    .weight(gpui::FontWeight::BOLD),
-            )
+            .child(Label::new(truncate_to(&item.subject, 52)).weight(gpui::FontWeight::BOLD))
             .child(
                 Label::new(item.status.as_str())
                     .size(LabelSize::Small)
@@ -1200,8 +1305,8 @@ impl WorkcatMapView {
                     .color(Color::Muted),
             )
             .child(
-                Label::new(truncate_to(&item.reference, 44))
-                    .size(LabelSize::XSmall)
+                Label::new(truncate_to(&item.reference, 40))
+                    .size(LabelSize::Small)
                     .color(Color::Muted),
             );
         Some(strip)
@@ -1325,7 +1430,7 @@ impl WorkcatMapView {
                     .rounded_full()
                     .bg(status_color),
             )
-            .child(Label::new(node.label.clone()).size(LabelSize::XSmall))
+            .child(Label::new(node.label.clone()).size(LabelSize::Small))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, event: &MouseDownEvent, window, cx| {
@@ -1445,6 +1550,7 @@ impl WorkcatMapView {
             .id("workcat-map-field")
             .flex_grow(1.)
             .overflow_scroll()
+            .track_scroll(&self.scroll_handle)
             .border_2()
             .border_color(if self.panel_focused {
                 colors.border_focused
@@ -1487,6 +1593,8 @@ impl Render for WorkcatMapView {
             .on_action(cx.listener(Self::redo))
             .on_action(cx.listener(Self::toggle_detail))
             .on_action(cx.listener(Self::auto_arrange))
+            .on_action(cx.listener(Self::squeeze))
+            .on_action(cx.listener(Self::fit))
             .on_action(cx.listener(Self::clear_filter))
             .on_action(cx.listener(Self::apply_lens))
             .on_action(cx.listener(Self::delete_lens))

@@ -5,17 +5,19 @@
 //! persisted position get a deterministic grid slot; every persisted
 //! `node_moved` position wins over the grid.
 
-/// Node size in logical pixels.
-pub const NODE_WIDTH: f32 = 150.0;
-pub const NODE_HEIGHT: f32 = 32.0;
-/// The nominal field the layout scatters nodes across.
+/// Node size in logical pixels. Sized for a readable Small label
+/// (~13px UI font) with breathing room, not the cramped v1 originals.
+pub const NODE_WIDTH: f32 = 176.0;
+pub const NODE_HEIGHT: f32 = 38.0;
+/// The nominal field the layout scatters nodes across. Tall enough
+/// for a 400-item grid at the current cell size.
 pub const FIELD_WIDTH: f32 = 1400.0;
-pub const FIELD_HEIGHT: f32 = 3000.0;
+pub const FIELD_HEIGHT: f32 = 4400.0;
 /// Grid cell size (node size plus gutters).
-pub const CELL_WIDTH: f32 = NODE_WIDTH + 24.0;
-pub const CELL_HEIGHT: f32 = NODE_HEIGHT + 18.0;
+pub const CELL_WIDTH: f32 = NODE_WIDTH + 28.0;
+pub const CELL_HEIGHT: f32 = NODE_HEIGHT + 22.0;
 /// Top-left padding before the first grid cell.
-pub const GRID_MARGIN: f32 = 12.0;
+pub const GRID_MARGIN: f32 = 16.0;
 
 /// Deterministic grid slot for the `ix`-th node without a persisted
 /// position. Row-major, `columns()` per row.
@@ -60,6 +62,136 @@ pub fn normalize_rect(a: (f32, f32), b: (f32, f32)) -> (f32, f32, f32, f32) {
 pub fn node_in_rect(pos: (f32, f32), rect: (f32, f32, f32, f32)) -> bool {
     let (min_x, min_y, max_x, max_y) = rect;
     pos.0 < max_x && pos.0 + NODE_WIDTH > min_x && pos.1 < max_y && pos.1 + NODE_HEIGHT > min_y
+}
+
+/// Bounding box of a set of node positions (top-left corners), as
+/// `(min_x, min_y, max_x, max_y)` including node extents.
+pub fn nodes_bbox(positions: &[(f32, f32)]) -> Option<(f32, f32, f32, f32)> {
+    let first = positions.first()?;
+    let mut bbox = (
+        first.0,
+        first.1,
+        first.0 + NODE_WIDTH,
+        first.1 + NODE_HEIGHT,
+    );
+    for &(x, y) in &positions[1..] {
+        bbox.0 = bbox.0.min(x);
+        bbox.1 = bbox.1.min(y);
+        bbox.2 = bbox.2.max(x + NODE_WIDTH);
+        bbox.3 = bbox.3.max(y + NODE_HEIGHT);
+    }
+    Some(bbox)
+}
+
+/// One rigid block for the squeeze: a connected component's bounding
+/// box (`w`, `h`) plus the member nodes' offsets inside it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Block {
+    pub w: f32,
+    pub h: f32,
+    /// `(member index, dx, dy)` relative to the block's top-left.
+    pub members: Vec<(usize, f32, f32)>,
+}
+
+/// Gap between packed blocks.
+pub const PACK_GUTTER: f32 = 28.0;
+
+/// Shelf-pack blocks (tallest first) into rows, wrapping at a target
+/// width chosen so the packed area's aspect ratio roughly matches the
+/// viewport — the point of squeeze is to reflow into however many
+/// columns actually fit, instead of one tall column (the SPA's
+/// `packGraphBlocks` semantics). Rather than guessing the width from
+/// an area formula (which collapses to one column for wide, flat
+/// blocks), simulate a range of candidate widths and keep the one
+/// whose packed bounding box best matches the viewport aspect.
+/// Returns each block's packed top-left, in input order.
+pub fn pack_blocks(blocks: &[Block], viewport_aspect: f32) -> Vec<(f32, f32)> {
+    if blocks.is_empty() {
+        return Vec::new();
+    }
+    // Tallest-first packing order; positions returned in input order.
+    let mut order: Vec<usize> = (0..blocks.len()).collect();
+    order.sort_by(|&a, &b| {
+        blocks[b]
+            .h
+            .total_cmp(&blocks[a].h)
+            .then(blocks[b].w.total_cmp(&blocks[a].w))
+    });
+    let aspect = viewport_aspect.max(0.1);
+    let widest = blocks.iter().map(|b| b.w).fold(0.0f32, f32::max);
+    let max_width = (FIELD_WIDTH - 2.0 * GRID_MARGIN).max(widest);
+
+    let simulate = |target_width: f32| -> (Vec<(f32, f32)>, f32) {
+        let mut positions = vec![(0.0, 0.0); blocks.len()];
+        let (mut x, mut y) = (GRID_MARGIN, GRID_MARGIN);
+        let mut shelf_height: f32 = 0.0;
+        let (mut max_x, mut max_y) = (GRID_MARGIN, GRID_MARGIN);
+        for &ix in &order {
+            let block = &blocks[ix];
+            if x > GRID_MARGIN && x + block.w > GRID_MARGIN + target_width {
+                x = GRID_MARGIN;
+                y += shelf_height + PACK_GUTTER;
+                shelf_height = 0.0;
+            }
+            positions[ix] = (x, y);
+            max_x = max_x.max(x + block.w);
+            max_y = max_y.max(y + block.h);
+            x += block.w + PACK_GUTTER;
+            shelf_height = shelf_height.max(block.h);
+        }
+        let packed_aspect = (max_x - GRID_MARGIN).max(1.0) / (max_y - GRID_MARGIN).max(1.0);
+        // Log-ratio distance treats 2x-too-wide and 2x-too-tall alike.
+        let score = (packed_aspect / aspect).ln().abs();
+        (positions, score)
+    };
+
+    const CANDIDATES: usize = 24;
+    let mut best: Option<(Vec<(f32, f32)>, f32)> = None;
+    for step in 0..=CANDIDATES {
+        let width = widest + (max_width - widest) * (step as f32 / CANDIDATES as f32);
+        let (positions, score) = simulate(width);
+        if best
+            .as_ref()
+            .is_none_or(|(_, best_score)| score < *best_score)
+        {
+            best = Some((positions, score));
+        }
+    }
+    best.expect("at least one candidate").0
+}
+
+/// Group node indices into connected components over undirected
+/// edges, for squeeze's rigid blocks.
+pub fn connected_components(node_count: usize, edges: &[(usize, usize)]) -> Vec<Vec<usize>> {
+    let mut adjacency = vec![Vec::new(); node_count];
+    for &(a, b) in edges {
+        if a < node_count && b < node_count {
+            adjacency[a].push(b);
+            adjacency[b].push(a);
+        }
+    }
+    let mut seen = vec![false; node_count];
+    let mut components = Vec::new();
+    for start in 0..node_count {
+        if seen[start] {
+            continue;
+        }
+        let mut component = Vec::new();
+        let mut queue = vec![start];
+        seen[start] = true;
+        while let Some(node) = queue.pop() {
+            component.push(node);
+            for &next in &adjacency[node] {
+                if !seen[next] {
+                    seen[next] = true;
+                    queue.push(next);
+                }
+            }
+        }
+        component.sort_unstable();
+        components.push(component);
+    }
+    components
 }
 
 #[cfg(test)]
@@ -122,5 +254,69 @@ mod tests {
         assert!(!node_in_rect((100.0 - NODE_WIDTH - 1.0, 150.0), rect));
         // Entirely below.
         assert!(!node_in_rect((150.0, 201.0), rect));
+    }
+
+    #[test]
+    fn bbox_spans_node_extents() {
+        assert_eq!(nodes_bbox(&[]), None);
+        let bbox = nodes_bbox(&[(10.0, 20.0), (200.0, 5.0)]).unwrap();
+        assert_eq!(bbox, (10.0, 5.0, 200.0 + NODE_WIDTH, 20.0 + NODE_HEIGHT));
+    }
+
+    #[test]
+    fn components_group_by_edges() {
+        // 0-1-2 chain, 3 isolated, 4-5 pair.
+        let components = connected_components(6, &[(0, 1), (1, 2), (4, 5)]);
+        assert_eq!(components, vec![vec![0, 1, 2], vec![3], vec![4, 5]]);
+    }
+
+    #[test]
+    fn packing_adapts_to_viewport_aspect() {
+        let blocks: Vec<Block> = (0..6)
+            .map(|ix| Block {
+                w: NODE_WIDTH,
+                h: NODE_HEIGHT,
+                members: vec![(ix, 0.0, 0.0)],
+            })
+            .collect();
+        let cols_at = |aspect: f32| {
+            let positions = pack_blocks(&blocks, aspect);
+            assert_eq!(positions.len(), 6);
+            // No two blocks at the same position.
+            let unique: std::collections::BTreeSet<(i64, i64)> = positions
+                .iter()
+                .map(|&(x, y)| (x as i64, y as i64))
+                .collect();
+            assert_eq!(unique.len(), 6);
+            let cols: std::collections::BTreeSet<i64> =
+                positions.iter().map(|&(x, _)| x as i64).collect();
+            cols.len()
+        };
+        // A wide viewport wants multiple columns; a very tall one
+        // wants a single column.
+        assert!(cols_at(3.0) > 1, "wide viewport should use columns");
+        assert_eq!(cols_at(0.05), 1, "tall viewport should stack");
+    }
+
+    #[test]
+    fn packing_keeps_tallest_block_intact_and_in_bounds() {
+        let blocks = vec![
+            Block {
+                w: 400.0,
+                h: 600.0,
+                members: vec![(0, 0.0, 0.0), (1, 100.0, 300.0)],
+            },
+            Block {
+                w: NODE_WIDTH,
+                h: NODE_HEIGHT,
+                members: vec![(2, 0.0, 0.0)],
+            },
+        ];
+        let positions = pack_blocks(&blocks, 1.5);
+        for &(x, y) in &positions {
+            assert!(x >= GRID_MARGIN);
+            assert!(y >= GRID_MARGIN);
+            assert!(x <= FIELD_WIDTH);
+        }
     }
 }
