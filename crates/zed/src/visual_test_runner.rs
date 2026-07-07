@@ -99,12 +99,12 @@ use {
     agent_servers::{AgentServer, AgentServerDelegate},
     anyhow::{Context as _, Result},
     assets::Assets,
-    editor::display_map::DisplayRow,
+    editor::{EditPredictionMultiBufferPreviewCase, display_map::DisplayRow},
     feature_flags::FeatureFlagAppExt as _,
     git_ui::project_diff::ProjectDiff,
     gpui::{
-        App, AppContext as _, Bounds, Entity, KeyBinding, Modifiers, VisualTestAppContext,
-        WindowBounds, WindowHandle, WindowOptions, point, px, size,
+        App, AppContext as _, Bounds, Entity, IntoElement, KeyBinding, Modifiers, Render,
+        VisualTestAppContext, WindowBounds, WindowHandle, WindowOptions, point, px, size,
     },
     image::RgbaImage,
     project::{AgentId, Project},
@@ -231,6 +231,20 @@ fn run_visual_tests(project_path: PathBuf, update_baseline: bool) -> Result<()> 
             editor::actions::ToggleBreakpoint,
             Some("Editor"),
         )]);
+        cx.bind_keys([
+            KeyBinding::new(
+                "alt-tab",
+                editor::actions::AcceptEditPrediction,
+                Some("Editor && edit_prediction"),
+            ),
+            KeyBinding::new(
+                "tab",
+                editor::actions::AcceptEditPrediction,
+                Some(
+                    "Editor && edit_prediction && edit_prediction_mode == eager && !showing_completions",
+                ),
+            ),
+        ]);
 
         // Disable agent notifications during visual tests to avoid popup windows
         agent_settings::AgentSettings::override_global(
@@ -547,6 +561,23 @@ fn run_visual_tests(project_path: PathBuf, update_baseline: bool) -> Result<()> 
         }
         Err(e) => {
             eprintln!("✗ diff_review_button: FAILED - {}", e);
+            failed += 1;
+        }
+    }
+
+    // Run Test: Edit prediction multi-buffer jump visual tests
+    println!("\n--- Test: edit_prediction_multibuffer_jumps (8 variants) ---");
+    match run_edit_prediction_multibuffer_jump_visual_tests(&mut cx, update_baseline) {
+        Ok(TestResult::Passed) => {
+            println!("✓ edit_prediction_multibuffer_jumps: PASSED");
+            passed += 1;
+        }
+        Ok(TestResult::BaselineUpdated(_)) => {
+            println!("✓ edit_prediction_multibuffer_jumps: Baselines updated");
+            updated += 1;
+        }
+        Err(e) => {
+            eprintln!("✗ edit_prediction_multibuffer_jumps: FAILED - {}", e);
             failed += 1;
         }
     }
@@ -3266,6 +3297,116 @@ fn run_thread_item_icon_decorations_visual_tests(
     }
 
     Ok(test_result)
+}
+
+#[cfg(target_os = "macos")]
+struct EditPredictionMultiBufferVisualTestView {
+    editor: Entity<editor::Editor>,
+}
+
+#[cfg(target_os = "macos")]
+impl Render for EditPredictionMultiBufferVisualTestView {
+    fn render(
+        &mut self,
+        _window: &mut gpui::Window,
+        cx: &mut gpui::Context<Self>,
+    ) -> impl IntoElement {
+        use ui::prelude::*;
+
+        div()
+            .size_full()
+            .bg(cx.theme().colors().editor_background)
+            .child(self.editor.clone())
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn open_edit_prediction_multibuffer_visual_test_window(
+    preview_case: &EditPredictionMultiBufferPreviewCase,
+    cx: &mut VisualTestAppContext,
+) -> Result<WindowHandle<EditPredictionMultiBufferVisualTestView>> {
+    let window_size = size(px(780.0), px(260.0));
+    let bounds = Bounds {
+        origin: point(px(0.0), px(0.0)),
+        size: window_size,
+    };
+
+    cx.update(|cx| {
+        cx.open_window(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(bounds)),
+                focus: false,
+                show: false,
+                ..Default::default()
+            },
+            |window, cx| {
+                let editor =
+                    editor::edit_prediction_multibuffer_preview_editor(preview_case, window, cx);
+                cx.new(|_| EditPredictionMultiBufferVisualTestView { editor })
+            },
+        )
+    })
+    .with_context(|| format!("Failed to open {}", preview_case.title))
+}
+
+#[cfg(target_os = "macos")]
+fn run_edit_prediction_multibuffer_jump_visual_tests(
+    cx: &mut VisualTestAppContext,
+    update_baseline: bool,
+) -> Result<TestResult> {
+    let mut has_baseline_update = None;
+    let mut first_error = None;
+
+    for preview_case in editor::edit_prediction_multibuffer_preview_cases() {
+        println!("  Capturing {}", preview_case.title);
+        let window = match open_edit_prediction_multibuffer_visual_test_window(preview_case, cx) {
+            Ok(window) => window,
+            Err(error) => {
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+                continue;
+            }
+        };
+
+        for _ in 0..5 {
+            cx.advance_clock(Duration::from_millis(100));
+            cx.run_until_parked();
+        }
+
+        let result = run_visual_test(preview_case.test_name, window.into(), cx, update_baseline);
+
+        cx.update_window(window.into(), |_, window, _cx| {
+            window.remove_window();
+        })
+        .log_err();
+        cx.run_until_parked();
+
+        match result {
+            Ok(TestResult::Passed) => {}
+            Ok(TestResult::BaselineUpdated(path)) => {
+                has_baseline_update = Some(path);
+            }
+            Err(error) => {
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+            }
+        }
+    }
+
+    for _ in 0..15 {
+        cx.advance_clock(Duration::from_millis(100));
+        cx.run_until_parked();
+    }
+
+    if let Some(error) = first_error {
+        Err(error)
+    } else if let Some(path) = has_baseline_update {
+        Ok(TestResult::BaselineUpdated(path))
+    } else {
+        Ok(TestResult::Passed)
+    }
 }
 
 #[cfg(target_os = "macos")]
