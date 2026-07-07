@@ -284,7 +284,10 @@ impl WorkcatDetailPanel {
         let view = cx.new(|cx| WorkcatDetailView::new(window, cx));
         Self {
             view,
-            position: DockPosition::Right,
+            // The map lives in the right dock; defaulting detail to
+            // the left lets both panels be open at once (one active
+            // panel per dock).
+            position: DockPosition::Left,
         }
     }
 
