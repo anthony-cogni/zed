@@ -23,7 +23,7 @@ use workspace::{
 };
 
 use crate::model::ItemMeta;
-use crate::panel::{WorkcatMapHandle, WorkcatMapView};
+use crate::panel::{WorkcatMapHandle, WorkcatMapView, ZoomIn, ZoomOut, ZoomReset};
 
 actions!(
     workcat_map,
@@ -52,6 +52,8 @@ pub struct WorkcatDetailView {
     notes_editor: Entity<Editor>,
     /// Which item id the notes editor currently holds text for.
     notes_item: Option<String>,
+    /// Text zoom for the reading surface (title, meta, sections).
+    zoom: f32,
     status: SharedString,
     _map_subscription: Option<Subscription>,
     _global_subscription: Subscription,
@@ -75,6 +77,7 @@ impl WorkcatDetailView {
             map: None,
             notes_editor,
             notes_item: None,
+            zoom: 1.0,
             status: SharedString::default(),
             _map_subscription: None,
             _global_subscription: global_subscription,
@@ -130,6 +133,24 @@ impl WorkcatDetailView {
         });
     }
 
+    const MIN_ZOOM: f32 = 0.7;
+    const MAX_ZOOM: f32 = 2.0;
+
+    fn zoom_in(&mut self, _: &ZoomIn, _window: &mut Window, cx: &mut Context<Self>) {
+        self.zoom = (self.zoom * 1.1).clamp(Self::MIN_ZOOM, Self::MAX_ZOOM);
+        cx.notify();
+    }
+
+    fn zoom_out(&mut self, _: &ZoomOut, _window: &mut Window, cx: &mut Context<Self>) {
+        self.zoom = (self.zoom / 1.1).clamp(Self::MIN_ZOOM, Self::MAX_ZOOM);
+        cx.notify();
+    }
+
+    fn zoom_reset(&mut self, _: &ZoomReset, _window: &mut Window, cx: &mut Context<Self>) {
+        self.zoom = 1.0;
+        cx.notify();
+    }
+
     fn save_notes(&mut self, cx: &mut Context<Self>) {
         let Some(id) = self.notes_item.clone() else {
             return;
@@ -159,11 +180,18 @@ impl WorkcatDetailView {
                 .into_any_element();
         };
         let status_color = WorkcatMapView::status_color(item.status, cx);
-        // Readability: body copy at the default UI size (never below),
-        // a bounded measure (~70ch at the UI font), 1.5-ish line
-        // rhythm via per-line padding, and clear space above each
-        // section heading so the layer-cake scans.
-        let measure = px(560.);
+        let accent = cx.theme().colors().text_accent;
+        let muted = cx.theme().colors().text_muted;
+        // Readability: body copy at the default UI size (never below
+        // at 100% zoom), a bounded measure (~70ch), 1.5-ish line
+        // rhythm, and clear space above each section heading so the
+        // layer-cake scans. All reading type scales with zoom.
+        let zoom = self.zoom;
+        let measure = px(560. * zoom);
+        let title_size = px(18.0 * zoom);
+        let meta_size = px(14.0 * zoom);
+        let heading_size = px(12.0 * zoom);
+        let body_size = px(15.0 * zoom);
         let mut body = v_flex()
             .id("workcat-detail-body")
             .size_full()
@@ -171,16 +199,17 @@ impl WorkcatDetailView {
             .gap_1()
             .overflow_y_scroll()
             .child(
-                div().max_w(measure).child(
-                    Label::new(item.subject.clone())
-                        .weight(gpui::FontWeight::BOLD)
-                        .size(LabelSize::Large),
-                ),
+                div()
+                    .max_w(measure)
+                    .text_size(title_size)
+                    .font_weight(gpui::FontWeight::BOLD)
+                    .child(item.subject.clone()),
             )
             .child(
                 h_flex()
                     .gap_2()
                     .pt_1()
+                    .text_size(meta_size)
                     .child(
                         div()
                             .flex_none()
@@ -190,31 +219,36 @@ impl WorkcatDetailView {
                             .bg(status_color),
                     )
                     .child(
-                        Label::new(item.status.as_str())
-                            .color(Color::Accent)
-                            .weight(gpui::FontWeight::MEDIUM),
+                        div()
+                            .text_color(accent)
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .child(SharedString::from(item.status.as_str())),
                     )
                     .child(
-                        Label::new(format!("{} deps", item.depends_on.len())).color(Color::Muted),
+                        div()
+                            .text_color(muted)
+                            .child(format!("{} deps", item.depends_on.len())),
                     )
-                    .child(Label::new(item.id8().to_string()).color(Color::Muted)),
+                    .child(div().text_color(muted).child(item.id8().to_string())),
             )
             .child(
-                Label::new(item.reference.clone())
-                    .size(LabelSize::Small)
-                    .color(Color::Muted),
+                div()
+                    .text_size(px(13.0 * zoom))
+                    .text_color(muted)
+                    .child(item.reference.clone()),
             );
         for (heading, section_body) in &item.sections {
             if heading.eq_ignore_ascii_case("notes") {
                 continue; // Rendered as the editable field below.
             }
             body = body.child(
-                div().pt_4().pb_1().child(
-                    Label::new(heading.to_uppercase())
-                        .size(LabelSize::Small)
-                        .weight(gpui::FontWeight::BOLD)
-                        .color(Color::Accent),
-                ),
+                div()
+                    .pt_4()
+                    .pb_1()
+                    .text_size(heading_size)
+                    .font_weight(gpui::FontWeight::BOLD)
+                    .text_color(accent)
+                    .child(heading.to_uppercase()),
             );
             for line in section_body.lines() {
                 if line.trim().is_empty() {
@@ -225,18 +259,20 @@ impl WorkcatDetailView {
                     div()
                         .max_w(measure)
                         .py_0p5()
-                        .child(Label::new(line.to_string())),
+                        .text_size(body_size)
+                        .child(line.to_string()),
                 );
             }
         }
         body = body
             .child(
-                div().pt_4().pb_1().child(
-                    Label::new("NOTES")
-                        .size(LabelSize::Small)
-                        .weight(gpui::FontWeight::BOLD)
-                        .color(Color::Accent),
-                ),
+                div()
+                    .pt_4()
+                    .pb_1()
+                    .text_size(heading_size)
+                    .font_weight(gpui::FontWeight::BOLD)
+                    .text_color(accent)
+                    .child("NOTES"),
             )
             .child(
                 div()
@@ -285,6 +321,9 @@ impl Render for WorkcatDetailView {
         v_flex()
             .key_context("WorkcatDetail")
             .track_focus(&self.focus_handle)
+            .on_action(cx.listener(Self::zoom_in))
+            .on_action(cx.listener(Self::zoom_out))
+            .on_action(cx.listener(Self::zoom_reset))
             .size_full()
             .bg(cx.theme().colors().panel_background)
             .child(self.render_body(window, cx))

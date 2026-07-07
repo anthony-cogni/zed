@@ -1704,7 +1704,18 @@
       "enter": "workcat_map::ToggleDetail",
       "cmd-z": "workcat_map::Undo",
       "cmd-shift-z": "workcat_map::Redo",
+      "cmd-=": "workcat_map::ZoomIn",
+      "cmd--": "workcat_map::ZoomOut",
+      "cmd-0": "workcat_map::ZoomReset",
       "escape": "workcat_map::ClearFocus",
+    },
+  },
+  {
+    "context": "WorkcatDetail",
+    "bindings": {
+      "cmd-=": "workcat_map::ZoomIn",
+      "cmd--": "workcat_map::ZoomOut",
+      "cmd-0": "workcat_map::ZoomReset",
     },
   },
 ]

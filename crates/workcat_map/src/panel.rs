@@ -64,6 +64,12 @@ actions!(
         Squeeze,
         /// Scrolls the field so the visible nodes are in view.
         Fit,
+        /// Zooms the view in (map: the whole field; detail: the text).
+        ZoomIn,
+        /// Zooms the view out.
+        ZoomOut,
+        /// Resets the zoom to 100%.
+        ZoomReset,
         /// Resets filters and search to the default scope.
         ClearFilter,
         /// Starts naming a lens to save the current filter as.
@@ -165,6 +171,10 @@ pub struct WorkcatMapView {
     /// Scroll state of the field viewport (drives Fit and gives
     /// Squeeze its viewport aspect).
     scroll_handle: ScrollHandle,
+    /// View zoom: scales the rendered field (positions, node size,
+    /// labels, edges). Node geometry stays in unzoomed field
+    /// coordinates everywhere else.
+    zoom: f32,
     /// The visibility filter (statuses + free-text query).
     filter: FilterState,
     search_editor: Entity<Editor>,
@@ -266,6 +276,7 @@ impl WorkcatMapView {
             rect_select: None,
             field_origin: Rc::new(Cell::new(Point::default())),
             scroll_handle: ScrollHandle::new(),
+            zoom: 1.0,
             filter: FilterState::default(),
             search_editor,
             lenses: BTreeMap::new(),
@@ -429,11 +440,12 @@ impl WorkcatMapView {
     }
 
     fn update_drag(&mut self, pointer: Point<Pixels>, cx: &mut Context<Self>) {
+        let zoom = self.zoom;
         if let Some(rect) = &mut self.rect_select {
             let origin = self.field_origin.get();
             rect.current = (
-                f32::from(pointer.x - origin.x),
-                f32::from(pointer.y - origin.y),
+                f32::from(pointer.x - origin.x) / zoom,
+                f32::from(pointer.y - origin.y) / zoom,
             );
             cx.notify();
             return;
@@ -441,8 +453,8 @@ impl WorkcatMapView {
         let Some(drag) = &self.drag else {
             return;
         };
-        let dx = f32::from(pointer.x - drag.pointer_start.x);
-        let dy = f32::from(pointer.y - drag.pointer_start.y);
+        let dx = f32::from(pointer.x - drag.pointer_start.x) / zoom;
+        let dy = f32::from(pointer.y - drag.pointer_start.y) / zoom;
         let moves: Vec<(usize, (f32, f32))> = drag
             .starts
             .iter()
@@ -522,8 +534,8 @@ impl WorkcatMapView {
         self.focused_node = None;
         let origin = self.field_origin.get();
         let at = (
-            f32::from(pointer.x - origin.x),
-            f32::from(pointer.y - origin.y),
+            f32::from(pointer.x - origin.x) / self.zoom,
+            f32::from(pointer.y - origin.y) / self.zoom,
         );
         self.rect_select = Some(RectSelect {
             start: at,
@@ -696,11 +708,52 @@ impl WorkcatMapView {
             cx.notify();
             return;
         };
-        // Offsets grow negative as content scrolls up/left.
+        // Offsets grow negative as content scrolls up/left, and live
+        // in zoomed (rendered) coordinates.
         self.scroll_handle.set_offset(point(
-            px(-(min_x - geometry::GRID_MARGIN).max(0.0)),
-            px(-(min_y - geometry::GRID_MARGIN).max(0.0)),
+            px(-((min_x - geometry::GRID_MARGIN).max(0.0) * self.zoom)),
+            px(-((min_y - geometry::GRID_MARGIN).max(0.0) * self.zoom)),
         ));
+        cx.notify();
+    }
+
+    // === Zoom ===
+
+    const MIN_ZOOM: f32 = 0.3;
+    const MAX_ZOOM: f32 = 2.5;
+
+    fn zoom_in(&mut self, _: &ZoomIn, _window: &mut Window, cx: &mut Context<Self>) {
+        self.set_zoom(self.zoom * 1.2, cx);
+    }
+
+    fn zoom_out(&mut self, _: &ZoomOut, _window: &mut Window, cx: &mut Context<Self>) {
+        self.set_zoom(self.zoom / 1.2, cx);
+    }
+
+    fn zoom_reset(&mut self, _: &ZoomReset, _window: &mut Window, cx: &mut Context<Self>) {
+        self.set_zoom(1.0, cx);
+    }
+
+    /// Change zoom keeping the viewport center anchored on the same
+    /// field point, so zooming feels like moving toward/away from
+    /// what you're looking at.
+    fn set_zoom(&mut self, new_zoom: f32, cx: &mut Context<Self>) {
+        let new_zoom = new_zoom.clamp(Self::MIN_ZOOM, Self::MAX_ZOOM);
+        if (new_zoom - self.zoom).abs() < f32::EPSILON {
+            return;
+        }
+        let viewport = self.scroll_handle.bounds().size;
+        let offset = self.scroll_handle.offset();
+        let center = (
+            (f32::from(-offset.x) + f32::from(viewport.width) / 2.0) / self.zoom,
+            (f32::from(-offset.y) + f32::from(viewport.height) / 2.0) / self.zoom,
+        );
+        self.zoom = new_zoom;
+        self.scroll_handle.set_offset(point(
+            px(-(center.0 * new_zoom - f32::from(viewport.width) / 2.0).max(0.0)),
+            px(-(center.1 * new_zoom - f32::from(viewport.height) / 2.0).max(0.0)),
+        ));
+        self.status = format!("zoom {:.0}%", self.zoom * 100.0).into();
         cx.notify();
     }
 
@@ -1054,6 +1107,9 @@ impl WorkcatMapView {
                 .action("Fit", Box::new(Fit))
                 .action("Squeeze", Box::new(Squeeze))
                 .action("Auto-arrange", Box::new(AutoArrange))
+                .action("Zoom In", Box::new(ZoomIn))
+                .action("Zoom Out", Box::new(ZoomOut))
+                .action("Zoom 100%", Box::new(ZoomReset))
                 .action("Undo", Box::new(Undo))
                 .action("Redo", Box::new(Redo))
                 .separator()
@@ -1139,6 +1195,13 @@ impl WorkcatMapView {
             .when_some(self.active_lens.clone(), |this, lens| {
                 this.child(
                     Label::new(format!("lens: {lens}"))
+                        .size(LabelSize::Small)
+                        .color(Color::Accent),
+                )
+            })
+            .when((self.zoom - 1.0).abs() > 0.01, |this| {
+                this.child(
+                    Label::new(format!("{:.0}%", self.zoom * 100.0))
                         .size(LabelSize::Small)
                         .color(Color::Accent),
                 )
@@ -1319,6 +1382,7 @@ impl WorkcatMapView {
         let color = cx.theme().colors().text_muted.alpha(0.5);
         let focused_color = cx.theme().colors().text_accent;
         let focused = self.focused_node;
+        let zoom = self.zoom;
         let segments: Vec<((f32, f32), (f32, f32), bool)> = self
             .edges
             .iter()
@@ -1326,8 +1390,8 @@ impl WorkcatMapView {
                 let (from, to) = (&self.nodes[from_ix], &self.nodes[to_ix]);
                 let center = |n: &MapNode| {
                     (
-                        n.x + geometry::NODE_WIDTH / 2.0,
-                        n.y + geometry::NODE_HEIGHT / 2.0,
+                        (n.x + geometry::NODE_WIDTH / 2.0) * zoom,
+                        (n.y + geometry::NODE_HEIGHT / 2.0) * zoom,
                     )
                 };
                 let lit = focused == Some(from_ix) || focused == Some(to_ix);
@@ -1355,8 +1419,8 @@ impl WorkcatMapView {
                         let len = (dx * dx + dy * dy).sqrt().max(1.0);
                         let (ux, uy) = (dx / len, dy / len);
                         let tip = (
-                            x2 - ux * geometry::NODE_HEIGHT,
-                            y2 - uy * geometry::NODE_HEIGHT,
+                            x2 - ux * geometry::NODE_HEIGHT * zoom,
+                            y2 - uy * geometry::NODE_HEIGHT * zoom,
                         );
                         for angle in [2.6f32, -2.6] {
                             let (sin, cos) = angle.sin_cos();
@@ -1388,12 +1452,13 @@ impl WorkcatMapView {
         });
         let focused = self.focused_node == Some(node_ix);
         let selected = self.selected.contains(&item.id);
+        let zoom = self.zoom;
         div()
             .absolute()
-            .left(px(node.x))
-            .top(px(node.y))
-            .w(px(geometry::NODE_WIDTH))
-            .h(px(geometry::NODE_HEIGHT))
+            .left(px(node.x * zoom))
+            .top(px(node.y * zoom))
+            .w(px(geometry::NODE_WIDTH * zoom))
+            .h(px(geometry::NODE_HEIGHT * zoom))
             .px_1()
             .gap_1()
             .flex()
@@ -1425,12 +1490,17 @@ impl WorkcatMapView {
             .child(
                 div()
                     .flex_none()
-                    .w_2()
-                    .h_2()
+                    .w(px(8.0 * zoom))
+                    .h(px(8.0 * zoom))
                     .rounded_full()
                     .bg(status_color),
             )
-            .child(Label::new(node.label.clone()).size(LabelSize::Small))
+            .child(
+                div()
+                    .text_size(px(12.5 * zoom))
+                    .overflow_hidden()
+                    .child(node.label.clone()),
+            )
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, event: &MouseDownEvent, window, cx| {
@@ -1447,18 +1517,20 @@ impl WorkcatMapView {
             )
     }
 
-    /// The in-flight selection rectangle, in field coordinates.
+    /// The in-flight selection rectangle (stored in field
+    /// coordinates, rendered zoomed).
     fn render_rect_select(&self, cx: &Context<Self>) -> Option<impl IntoElement> {
         let rect = self.rect_select.as_ref()?;
         let (min_x, min_y, max_x, max_y) = geometry::normalize_rect(rect.start, rect.current);
+        let zoom = self.zoom;
         let accent = cx.theme().colors().text_accent;
         Some(
             div()
                 .absolute()
-                .left(px(min_x))
-                .top(px(min_y))
-                .w(px(max_x - min_x))
-                .h(px(max_y - min_y))
+                .left(px(min_x * zoom))
+                .top(px(min_y * zoom))
+                .w(px((max_x - min_x) * zoom))
+                .h(px((max_y - min_y) * zoom))
                 .border_1()
                 .border_color(accent)
                 .bg(accent.alpha(0.08)),
@@ -1515,8 +1587,8 @@ impl WorkcatMapView {
         let colors = cx.theme().colors().clone();
         let mut content = div()
             .relative()
-            .w(px(geometry::FIELD_WIDTH))
-            .h(px(geometry::FIELD_HEIGHT))
+            .w(px(geometry::FIELD_WIDTH * self.zoom))
+            .h(px(geometry::FIELD_HEIGHT * self.zoom))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, event: &MouseDownEvent, window, cx| {
@@ -1595,6 +1667,9 @@ impl Render for WorkcatMapView {
             .on_action(cx.listener(Self::auto_arrange))
             .on_action(cx.listener(Self::squeeze))
             .on_action(cx.listener(Self::fit))
+            .on_action(cx.listener(Self::zoom_in))
+            .on_action(cx.listener(Self::zoom_out))
+            .on_action(cx.listener(Self::zoom_reset))
             .on_action(cx.listener(Self::clear_filter))
             .on_action(cx.listener(Self::apply_lens))
             .on_action(cx.listener(Self::delete_lens))
