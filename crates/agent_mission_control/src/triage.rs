@@ -123,6 +123,13 @@ static NEGATION_RE: LazyLock<Regex> = LazyLock::new(|| {
     .expect("negation regex is valid")
 });
 
+/// An ask that BEGINS with a bare negation ("Nothing right now. ...",
+/// "Nothing. If you'd like...") is negated regardless of what follows in
+/// the same captured line.
+static LEADING_NEGATION_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)^(nothing|none|no action)\b").expect("leading negation regex is valid")
+});
+
 /// Decide which attention bucket a thread belongs in.
 ///
 /// Priority order (from research on real thread history):
@@ -266,7 +273,7 @@ pub fn extract_ask(text: &str) -> Option<Ask> {
                 skipped_lines.push(line_start);
                 continue;
             };
-            if NEGATION_RE.is_match(&ask) {
+            if NEGATION_RE.is_match(&ask) || LEADING_NEGATION_RE.is_match(&ask) {
                 skipped_lines.push(line_start);
                 continue;
             }
@@ -550,6 +557,30 @@ mod tests {
                 ),
                 expected_state: TriageState::Done,
                 expected_ask: None,
+            },
+            Case {
+                name: "bare 'Nothing right now' negates; soft offer survives as done",
+                input: agent_input(
+                    "The stylesheet is committed and the sample renders match. \
+                     What I need from you: Nothing right now. Let me know if you'd \
+                     like me to run a real PDF render against a sample report.",
+                ),
+                expected_state: TriageState::Done,
+                expected_ask: Some(
+                    "Let me know if you'd like me to run a real PDF render against a sample report.",
+                ),
+            },
+            Case {
+                name: "bare 'Nothing.' negates; trailing offer survives as done",
+                input: agent_input(
+                    "The symlink audit is written up and every path checks out. \
+                     What I need from you: Nothing. If you'd like, I can also triage \
+                     the handful of newly-synced unknown items.",
+                ),
+                expected_state: TriageState::Done,
+                expected_ask: Some(
+                    "If you'd like, I can also triage the handful of newly-synced unknown items.",
+                ),
             },
             Case {
                 name: "hard ask beats a later soft offer",
