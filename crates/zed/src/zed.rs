@@ -787,8 +787,22 @@ fn initialize_panels(window: &mut Window, cx: &mut Context<Workspace>) -> Task<a
             add_panel_when_ready(mission_control_panel, workspace_handle.clone(), cx.clone()),
             add_panel_when_ready(workcat_map_panel, workspace_handle.clone(), cx.clone()),
             add_panel_when_ready(workcat_detail_panel, workspace_handle.clone(), cx.clone()),
-            initialize_agent_panel(workspace_handle, cx.clone()).map(|r| r.log_err()),
+            initialize_agent_panel(workspace_handle.clone(), cx.clone()).map(|r| r.log_err()),
         );
+
+        // The workcat map shares the right dock with the agent panel,
+        // which claims the dock's active slot during its own async
+        // init. Activate the map last so the default layout actually
+        // shows the map (and the detail pane on the left) together,
+        // rather than the map losing the startup race. The user can
+        // still switch to the agent panel; that choice is serialized.
+        workspace_handle
+            .update_in(cx, |workspace, window, cx| {
+                if workspace.panel::<workcat_map::WorkcatMapPanel>(cx).is_some() {
+                    workspace.open_panel::<workcat_map::WorkcatMapPanel>(window, cx);
+                }
+            })
+            .log_err();
 
         anyhow::Ok(())
     })
