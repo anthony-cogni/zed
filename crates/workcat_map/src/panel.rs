@@ -1883,6 +1883,11 @@ impl Panel for WorkcatMapPanel {
         px(DEFAULT_WIDTH)
     }
 
+    fn starts_open(&self, _window: &Window, _cx: &App) -> bool {
+        // Default layout shows the map and the detail pane together.
+        true
+    }
+
     fn icon(&self, _window: &Window, _cx: &App) -> Option<IconName> {
         Some(IconName::Blocks)
     }

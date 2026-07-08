@@ -34,7 +34,10 @@ actions!(
 );
 
 const WORKCAT_DETAIL_PANEL_KEY: &str = "WorkcatDetailPanel";
+/// Minimum default width (px) for the reading pane on narrow windows.
 const DEFAULT_WIDTH: f32 = 420.;
+/// Fraction of the window width the reading pane defaults to (~1/5-1/4).
+const DETAIL_WIDTH_FRACTION: f32 = 0.22;
 
 pub fn init(cx: &mut App) {
     cx.observe_new(|workspace: &mut Workspace, _, _| {
@@ -399,8 +402,18 @@ impl Panel for WorkcatDetailPanel {
         cx.notify();
     }
 
-    fn default_size(&self, _window: &Window, _cx: &App) -> Pixels {
-        px(DEFAULT_WIDTH)
+    fn default_size(&self, window: &Window, _cx: &App) -> Pixels {
+        // Default the reading pane to ~22% of the window width (between
+        // 1/5 and 1/4), with a floor so it stays usable on narrow
+        // windows. A previously dragged size is restored from serialized
+        // state and takes precedence over this default.
+        let viewport_width = window.viewport_size().width;
+        (viewport_width * DETAIL_WIDTH_FRACTION).max(px(DEFAULT_WIDTH))
+    }
+
+    fn starts_open(&self, _window: &Window, _cx: &App) -> bool {
+        // Default layout shows the map and the detail pane together.
+        true
     }
 
     fn icon(&self, _window: &Window, _cx: &App) -> Option<IconName> {
