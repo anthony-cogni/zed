@@ -25,7 +25,8 @@ use futures::StreamExt as _;
 use gpui::{
     App, AsyncWindowContext, Context, DismissEvent, DispatchPhase, Entity, EventEmitter,
     FocusHandle, Focusable, Hsla, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    PathBuilder, Pixels, Point, ScrollHandle, SharedString, Subscription, Task, WeakEntity, Window,
+    PathBuilder, PinchEvent, Pixels, Point, ScrollHandle, SharedString, Subscription, Task,
+    WeakEntity, Window,
     actions, anchored, canvas, deferred, point, px,
 };
 use ui::{ContextMenu, prelude::*};
@@ -822,23 +823,62 @@ impl WorkcatMapView {
     /// field point, so zooming feels like moving toward/away from
     /// what you're looking at.
     fn set_zoom(&mut self, new_zoom: f32, cx: &mut Context<Self>) {
+        self.set_zoom_anchored(new_zoom, None, cx);
+    }
+
+    /// Change zoom keeping the field point under `anchor` (a window-space
+    /// point, e.g. the pinch center) fixed on screen. With `None` the
+    /// viewport center is held instead — used by the zoom in/out actions,
+    /// so those feel like moving toward/away from what you're looking at.
+    fn set_zoom_anchored(
+        &mut self,
+        new_zoom: f32,
+        anchor: Option<Point<Pixels>>,
+        cx: &mut Context<Self>,
+    ) {
         let new_zoom = new_zoom.clamp(Self::MIN_ZOOM, Self::MAX_ZOOM);
         if (new_zoom - self.zoom).abs() < f32::EPSILON {
             return;
         }
-        let viewport = self.scroll_handle.bounds().size;
+        let bounds = self.scroll_handle.bounds();
+        let viewport = bounds.size;
         let offset = self.scroll_handle.offset();
-        let center = (
-            (f32::from(-offset.x) + f32::from(viewport.width) / 2.0) / self.zoom,
-            (f32::from(-offset.y) + f32::from(viewport.height) / 2.0) / self.zoom,
+        // Anchor in viewport-local coordinates: the pinch center converted
+        // out of window space, or the viewport center when no anchor given.
+        let anchor = anchor
+            .map(|p| p - bounds.origin)
+            .unwrap_or_else(|| point(viewport.width / 2.0, viewport.height / 2.0));
+        // Field-space point currently under the anchor. Offsets are <= 0 and
+        // grow negative as content scrolls down/right, so subtracting the
+        // offset shifts the anchor into content space before dividing out
+        // the old zoom.
+        let field = (
+            (f32::from(anchor.x) - f32::from(offset.x)) / self.zoom,
+            (f32::from(anchor.y) - f32::from(offset.y)) / self.zoom,
         );
         self.zoom = new_zoom;
+        // Re-derive the scroll offset so that same field point lands back
+        // under the anchor. Clamp to <= 0 (can't scroll past the top-left
+        // origin), matching the invariant the rest of the panel relies on.
         self.scroll_handle.set_offset(point(
-            px(-(center.0 * new_zoom - f32::from(viewport.width) / 2.0).max(0.0)),
-            px(-(center.1 * new_zoom - f32::from(viewport.height) / 2.0).max(0.0)),
+            px(-(field.0 * new_zoom - f32::from(anchor.x)).max(0.0)),
+            px(-(field.1 * new_zoom - f32::from(anchor.y)).max(0.0)),
         ));
         self.status = format!("zoom {:.0}%", self.zoom * 100.0).into();
         cx.notify();
+    }
+
+    /// Trackpad pinch-to-zoom. `delta` is the incremental magnification for
+    /// this event (0.1 == +10%), so the running gesture compounds naturally.
+    /// Anchored at the pinch center so the field point under the fingers
+    /// stays put. Pinch events dispatch by hitbox, so this fires whenever
+    /// the pointer is over the map — the panel need not hold focus.
+    fn handle_pinch(&mut self, event: &PinchEvent, cx: &mut Context<Self>) {
+        if event.delta == 0.0 {
+            return;
+        }
+        let new_zoom = self.zoom * (1.0 + event.delta);
+        self.set_zoom_anchored(new_zoom, Some(event.position), cx);
     }
 
     /// Apply `(node_ix, target)` moves as one undoable operation,
@@ -1717,6 +1757,9 @@ impl WorkcatMapView {
             .flex_grow(1.)
             .overflow_scroll()
             .track_scroll(&self.scroll_handle)
+            .on_pinch(cx.listener(|this, event: &PinchEvent, _window, cx| {
+                this.handle_pinch(event, cx);
+            }))
             .border_2()
             .border_color(if self.panel_focused {
                 colors.border_focused
