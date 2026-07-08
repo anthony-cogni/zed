@@ -160,6 +160,122 @@ pub fn pack_blocks(blocks: &[Block], viewport_aspect: f32) -> Vec<(f32, f32)> {
     best.expect("at least one candidate").0
 }
 
+/// Row spacing for the layered layout — roomier than the grid so the
+/// dependency edges between rows read clearly.
+pub const LAYER_ROW_HEIGHT: f32 = NODE_HEIGHT + 52.0;
+
+/// A compact layered (Sugiyama-lite) layout for one connected
+/// component: dependencies sit on lower rows than their dependents
+/// (arrows point down), rows are barycenter-ordered to reduce edge
+/// crossings, and each row is centered. Edges are `(dependent,
+/// dependency)` in local indices. Returns top-left positions,
+/// normalized so the minimum is `(0, 0)`.
+pub fn layered_layout(count: usize, edges: &[(usize, usize)]) -> Vec<(f32, f32)> {
+    if count == 0 {
+        return Vec::new();
+    }
+    // Depth = longest dependency chain below the node (cycle-safe:
+    // a back edge contributes depth 0 instead of recursing forever).
+    let mut deps = vec![Vec::new(); count];
+    for &(dependent, dependency) in edges {
+        if dependent < count && dependency < count {
+            deps[dependent].push(dependency);
+        }
+    }
+    fn depth_of(
+        node: usize,
+        deps: &[Vec<usize>],
+        memo: &mut [Option<usize>],
+        on_stack: &mut [bool],
+    ) -> usize {
+        if let Some(depth) = memo[node] {
+            return depth;
+        }
+        if on_stack[node] {
+            return 0;
+        }
+        on_stack[node] = true;
+        let depth = deps[node]
+            .iter()
+            .map(|&dep| depth_of(dep, deps, memo, on_stack) + 1)
+            .max()
+            .unwrap_or(0);
+        on_stack[node] = false;
+        memo[node] = Some(depth);
+        depth
+    }
+    let mut memo = vec![None; count];
+    let mut on_stack = vec![false; count];
+    let depths: Vec<usize> = (0..count)
+        .map(|node| depth_of(node, &deps, &mut memo, &mut on_stack))
+        .collect();
+    let max_depth = depths.iter().copied().max().unwrap_or(0);
+
+    // Rows top-to-bottom: dependents (deepest chains) on top.
+    let mut rows: Vec<Vec<usize>> = vec![Vec::new(); max_depth + 1];
+    for node in 0..count {
+        rows[max_depth - depths[node]].push(node);
+    }
+
+    // Undirected adjacency for barycenter ordering.
+    let mut adjacency = vec![Vec::new(); count];
+    for &(a, b) in edges {
+        if a < count && b < count {
+            adjacency[a].push(b);
+            adjacency[b].push(a);
+        }
+    }
+    let mut slot = vec![0.0f32; count];
+    let assign_slots = |rows: &[Vec<usize>], slot: &mut [f32]| {
+        for row in rows {
+            for (ix, &node) in row.iter().enumerate() {
+                slot[node] = ix as f32;
+            }
+        }
+    };
+    assign_slots(&rows, &mut slot);
+    // Two barycenter sweeps (down, then up): order each row by the
+    // mean slot of its neighbors.
+    for _ in 0..2 {
+        for row in rows.iter_mut() {
+            row.sort_by(|&a, &b| {
+                let mean = |node: usize| {
+                    let neighbors = &adjacency[node];
+                    if neighbors.is_empty() {
+                        slot[node]
+                    } else {
+                        neighbors.iter().map(|&n| slot[n]).sum::<f32>() / neighbors.len() as f32
+                    }
+                };
+                mean(a).total_cmp(&mean(b))
+            });
+        }
+        assign_slots(&rows, &mut slot);
+    }
+
+    // Positions: rows stacked vertically, each row centered.
+    let widest = rows.iter().map(Vec::len).max().unwrap_or(1) as f32;
+    let mut positions = vec![(0.0, 0.0); count];
+    for (row_ix, row) in rows.iter().enumerate() {
+        let row_width = row.len() as f32;
+        let x0 = (widest - row_width) / 2.0 * CELL_WIDTH;
+        for (ix, &node) in row.iter().enumerate() {
+            positions[node] = (
+                x0 + ix as f32 * CELL_WIDTH,
+                row_ix as f32 * LAYER_ROW_HEIGHT,
+            );
+        }
+    }
+    // Normalize to a (0, 0) minimum.
+    let min_x = positions.iter().map(|p| p.0).fold(f32::MAX, f32::min);
+    let min_y = positions.iter().map(|p| p.1).fold(f32::MAX, f32::min);
+    for position in &mut positions {
+        position.0 -= min_x;
+        position.1 -= min_y;
+    }
+    positions
+}
+
 /// Group node indices into connected components over undirected
 /// edges, for squeeze's rigid blocks.
 pub fn connected_components(node_count: usize, edges: &[(usize, usize)]) -> Vec<Vec<usize>> {
@@ -296,6 +412,38 @@ mod tests {
         // wants a single column.
         assert!(cols_at(3.0) > 1, "wide viewport should use columns");
         assert_eq!(cols_at(0.05), 1, "tall viewport should stack");
+    }
+
+    #[test]
+    fn layered_layout_stacks_chains_vertically() {
+        // 0 depends on 1, 1 depends on 2: three rows, one column,
+        // dependent on top.
+        let positions = layered_layout(3, &[(0, 1), (1, 2)]);
+        assert_eq!(positions[0].1, 0.0);
+        assert_eq!(positions[1].1, LAYER_ROW_HEIGHT);
+        assert_eq!(positions[2].1, 2.0 * LAYER_ROW_HEIGHT);
+        assert!(positions.iter().all(|p| p.0 == positions[0].0));
+    }
+
+    #[test]
+    fn layered_layout_centers_the_diamond() {
+        // 0 depends on 1 and 2; both depend on 3.
+        let positions = layered_layout(4, &[(0, 1), (0, 2), (1, 3), (2, 3)]);
+        // Rows: [0], [1, 2], [3].
+        assert_eq!(positions[0].1, 0.0);
+        assert_eq!(positions[1].1, LAYER_ROW_HEIGHT);
+        assert_eq!(positions[2].1, LAYER_ROW_HEIGHT);
+        assert_eq!(positions[3].1, 2.0 * LAYER_ROW_HEIGHT);
+        // Single-node rows center over the two-node row.
+        let mid = (positions[1].0 + positions[2].0) / 2.0;
+        assert_eq!(positions[0].0, mid);
+        assert_eq!(positions[3].0, mid);
+    }
+
+    #[test]
+    fn layered_layout_survives_cycles() {
+        let positions = layered_layout(2, &[(0, 1), (1, 0)]);
+        assert_eq!(positions.len(), 2);
     }
 
     #[test]

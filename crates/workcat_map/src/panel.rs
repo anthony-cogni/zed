@@ -426,7 +426,8 @@ impl WorkcatMapView {
         };
         let pressed_id = self.items[node.item_ix].id.clone();
         // Dragging a selected node moves the whole selection; dragging
-        // an unselected node drops the selection and moves just it.
+        // an unselected node moves just it — the selection is kept
+        // (only an explicit background click or escape deselects).
         let starts: Vec<(usize, (f32, f32))> =
             if self.selected.contains(&pressed_id) && self.selected.len() > 1 {
                 self.nodes
@@ -436,7 +437,6 @@ impl WorkcatMapView {
                     .map(|(ix, node)| (ix, (node.x, node.y)))
                     .collect()
             } else {
-                self.selected.clear();
                 vec![(node_ix, (node.x, node.y))]
             };
         self.focused_node = Some(node_ix);
@@ -678,9 +678,11 @@ impl WorkcatMapView {
         cx.notify();
     }
 
-    /// The SPA's "squeeze": treat each connected component of the
-    /// visible graph as a rigid block (preserving your arrangement
-    /// inside it) and shelf-pack the blocks into a compact layout
+    /// The SPA's "squeeze", upgraded: each multi-node connected
+    /// component gets a fresh compact layered layout (dependents
+    /// above dependencies, barycenter-ordered — no more giant sparse
+    /// blocks from old drag positions), all isolated nodes pool into
+    /// one dense grid block, and the blocks shelf-pack into a layout
     /// whose aspect roughly matches the viewport. Persisted as
     /// ordinary node moves, so it composes with manual nudges and is
     /// one undo step.
@@ -691,25 +693,60 @@ impl WorkcatMapView {
             return;
         }
         let components = geometry::connected_components(self.nodes.len(), &self.edges);
-        let blocks: Vec<geometry::Block> = components
-            .iter()
-            .map(|members| {
-                let positions: Vec<(f32, f32)> = members
+        let mut blocks: Vec<geometry::Block> = Vec::new();
+        let mut singles: Vec<usize> = Vec::new();
+        for members in &components {
+            if members.len() == 1 {
+                singles.push(members[0]);
+                continue;
+            }
+            let local_ix: HashMap<usize, usize> = members
+                .iter()
+                .enumerate()
+                .map(|(local, &global)| (global, local))
+                .collect();
+            let local_edges: Vec<(usize, usize)> = self
+                .edges
+                .iter()
+                .filter_map(|&(a, b)| Some((*local_ix.get(&a)?, *local_ix.get(&b)?)))
+                .collect();
+            let layout = geometry::layered_layout(members.len(), &local_edges);
+            let (min_x, min_y, max_x, max_y) =
+                geometry::nodes_bbox(&layout).expect("non-empty component");
+            blocks.push(geometry::Block {
+                w: max_x - min_x,
+                h: max_y - min_y,
+                members: members
                     .iter()
-                    .map(|&ix| (self.nodes[ix].x, self.nodes[ix].y))
-                    .collect();
-                let (min_x, min_y, max_x, max_y) =
-                    geometry::nodes_bbox(&positions).expect("non-empty component");
-                geometry::Block {
-                    w: max_x - min_x,
-                    h: max_y - min_y,
-                    members: members
-                        .iter()
-                        .map(|&ix| (ix, self.nodes[ix].x - min_x, self.nodes[ix].y - min_y))
-                        .collect(),
-                }
-            })
-            .collect();
+                    .zip(&layout)
+                    .map(|(&global, &(x, y))| (global, x - min_x, y - min_y))
+                    .collect(),
+            });
+        }
+        if !singles.is_empty() {
+            // One dense, roughly square grid block for all isolated
+            // nodes, in their current sorted (status, subject) order.
+            let cols = (singles.len() as f32).sqrt().ceil().max(1.0) as usize;
+            let members: Vec<(usize, f32, f32)> = singles
+                .iter()
+                .enumerate()
+                .map(|(ix, &global)| {
+                    let col = ix % cols;
+                    let row = ix / cols;
+                    (
+                        global,
+                        col as f32 * geometry::CELL_WIDTH,
+                        row as f32 * geometry::CELL_HEIGHT,
+                    )
+                })
+                .collect();
+            let rows = singles.len().div_ceil(cols);
+            blocks.push(geometry::Block {
+                w: (cols - 1) as f32 * geometry::CELL_WIDTH + geometry::NODE_WIDTH,
+                h: (rows - 1) as f32 * geometry::CELL_HEIGHT + geometry::NODE_HEIGHT,
+                members,
+            });
+        }
         let viewport = self.scroll_handle.bounds().size;
         let aspect = if viewport.height > px(0.) {
             f32::from(viewport.width) / f32::from(viewport.height)
