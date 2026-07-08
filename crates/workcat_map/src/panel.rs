@@ -180,6 +180,10 @@ pub struct WorkcatMapView {
     /// Scroll state of the field viewport (drives Fit and gives
     /// Squeeze its viewport aspect).
     scroll_handle: ScrollHandle,
+    /// Center the view on the content once, after load, as soon as
+    /// the viewport has been measured (its bounds are only known
+    /// after the first paint).
+    needs_initial_fit: bool,
     /// View zoom: scales the rendered field (positions, node size,
     /// labels, edges). Node geometry stays in unzoomed field
     /// coordinates everywhere else.
@@ -286,6 +290,7 @@ impl WorkcatMapView {
             pan: None,
             field_origin: Rc::new(Cell::new(Point::default())),
             scroll_handle: ScrollHandle::new(),
+            needs_initial_fit: true,
             zoom: 1.0,
             filter: FilterState::default(),
             search_editor,
@@ -351,6 +356,7 @@ impl WorkcatMapView {
             let (a, b) = (&self.items[a], &self.items[b]);
             (a.status.layout_rank(), &a.subject).cmp(&(b.status.layout_rank(), &b.subject))
         });
+        let visible_count = visible.len();
         self.nodes = visible
             .iter()
             .enumerate()
@@ -360,7 +366,7 @@ impl WorkcatMapView {
                     .positions
                     .get(&item.id)
                     .copied()
-                    .unwrap_or_else(|| geometry::grid_position(slot));
+                    .unwrap_or_else(|| geometry::grid_position(slot, visible_count));
                 self.positions.insert(item.id.clone(), (x, y));
                 MapNode {
                     item_ix,
@@ -665,10 +671,11 @@ impl WorkcatMapView {
 
     /// Re-lay out the currently visible nodes on the deterministic
     /// grid (their current sorted order), recording one undo step.
-    fn auto_arrange(&mut self, _: &AutoArrange, _window: &mut Window, cx: &mut Context<Self>) {
-        let mut targets = Vec::with_capacity(self.nodes.len());
-        for slot in 0..self.nodes.len() {
-            targets.push((slot, geometry::grid_position(slot)));
+    fn auto_arrange(&mut self, _: &AutoArrange, window: &mut Window, cx: &mut Context<Self>) {
+        let count = self.nodes.len();
+        let mut targets = Vec::with_capacity(count);
+        for slot in 0..count {
+            targets.push((slot, geometry::grid_position(slot, count)));
         }
         let moved = self.apply_layout(&targets, cx);
         self.status = if moved == 0 {
@@ -676,7 +683,7 @@ impl WorkcatMapView {
         } else {
             format!("arranged {moved} nodes").into()
         };
-        cx.notify();
+        self.fit(&Fit, window, cx);
     }
 
     /// The SPA's "squeeze", upgraded: each multi-node connected
@@ -770,21 +777,26 @@ impl WorkcatMapView {
         self.fit(&Fit, window, cx);
     }
 
-    /// Scroll the field so the visible nodes' bounding box starts in
-    /// view (the panel has no zoom; squeeze is the "make it all fit"
+    /// Scroll the field so the visible nodes' bounding box is
+    /// centered in the viewport (squeeze is the "make it all fit"
     /// half, fit is the "take me there" half).
     fn fit(&mut self, _: &Fit, _window: &mut Window, cx: &mut Context<Self>) {
         let positions: Vec<(f32, f32)> = self.nodes.iter().map(|node| (node.x, node.y)).collect();
-        let Some((min_x, min_y, _, _)) = geometry::nodes_bbox(&positions) else {
+        let Some((min_x, min_y, max_x, max_y)) = geometry::nodes_bbox(&positions) else {
             self.status = "nothing to fit".into();
             cx.notify();
             return;
         };
+        let viewport = self.scroll_handle.bounds().size;
+        let center = (
+            (min_x + max_x) / 2.0 * self.zoom,
+            (min_y + max_y) / 2.0 * self.zoom,
+        );
         // Offsets grow negative as content scrolls up/left, and live
         // in zoomed (rendered) coordinates.
         self.scroll_handle.set_offset(point(
-            px(-((min_x - geometry::GRID_MARGIN).max(0.0) * self.zoom)),
-            px(-((min_y - geometry::GRID_MARGIN).max(0.0) * self.zoom)),
+            px(-(center.0 - f32::from(viewport.width) / 2.0).max(0.0)),
+            px(-(center.1 - f32::from(viewport.height) / 2.0).max(0.0)),
         ));
         cx.notify();
     }
@@ -1736,7 +1748,14 @@ impl Focusable for WorkcatMapView {
 }
 
 impl Render for WorkcatMapView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.needs_initial_fit
+            && !self.loading
+            && self.scroll_handle.bounds().size.height > px(0.)
+        {
+            self.needs_initial_fit = false;
+            self.fit(&Fit, window, cx);
+        }
         v_flex()
             .key_context("WorkcatMap")
             .track_focus(&self.focus_handle)

@@ -10,30 +10,49 @@
 /// setting, with tight margins.
 pub const NODE_WIDTH: f32 = 224.0;
 pub const NODE_HEIGHT: f32 = 76.0;
-/// The nominal field the layout scatters nodes across. Tall enough
-/// for a 400-item grid at the current cell size.
-pub const FIELD_WIDTH: f32 = 1600.0;
-pub const FIELD_HEIGHT: f32 = 6400.0;
+/// The field the layout scatters nodes across — ~8x the previous
+/// canvas area. Layouts center content in it (growing from the
+/// middle out), and the view defaults to the content's center.
+pub const FIELD_WIDTH: f32 = 4800.0;
+pub const FIELD_HEIGHT: f32 = 19200.0;
+/// The nominal width of the "home" layout region centered in the
+/// field: grid layouts wrap at this width rather than sprawling the
+/// full canvas.
+pub const HOME_WIDTH: f32 = 1600.0;
 /// Grid cell size (node size plus tight gutters).
 pub const CELL_WIDTH: f32 = NODE_WIDTH + 16.0;
 pub const CELL_HEIGHT: f32 = NODE_HEIGHT + 14.0;
 /// Top-left padding before the first grid cell.
 pub const GRID_MARGIN: f32 = 16.0;
 
-/// Deterministic grid slot for the `ix`-th node without a persisted
-/// position. Row-major, `columns()` per row.
-pub fn grid_position(ix: usize) -> (f32, f32) {
+/// Deterministic grid slot for the `ix`-th node in a `count`-node
+/// grid, centered in the field. Row-major, `columns()` per row.
+pub fn grid_position(ix: usize, count: usize) -> (f32, f32) {
+    let (origin_x, origin_y) = grid_origin(count);
     let cols = columns();
     let col = ix % cols;
     let row = ix / cols;
     (
-        GRID_MARGIN + col as f32 * CELL_WIDTH,
-        GRID_MARGIN + row as f32 * CELL_HEIGHT,
+        origin_x + col as f32 * CELL_WIDTH,
+        origin_y + row as f32 * CELL_HEIGHT,
+    )
+}
+
+/// Top-left of a centered grid of `count` nodes.
+fn grid_origin(count: usize) -> (f32, f32) {
+    let count = count.max(1);
+    let cols = columns().min(count);
+    let rows = count.div_ceil(columns());
+    let width = cols as f32 * CELL_WIDTH - (CELL_WIDTH - NODE_WIDTH);
+    let height = rows as f32 * CELL_HEIGHT - (CELL_HEIGHT - NODE_HEIGHT);
+    (
+        ((FIELD_WIDTH - width) / 2.0).max(GRID_MARGIN),
+        ((FIELD_HEIGHT - height) / 2.0).max(GRID_MARGIN),
     )
 }
 
 fn columns() -> usize {
-    (((FIELD_WIDTH - 2.0 * GRID_MARGIN) / CELL_WIDTH) as usize).max(1)
+    (((HOME_WIDTH - 2.0 * GRID_MARGIN) / CELL_WIDTH) as usize).max(1)
 }
 
 /// Clamp a dragged position so the node cannot be lost at negative
@@ -158,7 +177,26 @@ pub fn pack_blocks(blocks: &[Block], viewport_aspect: f32) -> Vec<(f32, f32)> {
             best = Some((positions, score));
         }
     }
-    best.expect("at least one candidate").0
+    let mut positions = best.expect("at least one candidate").0;
+    // Center the packed arrangement in the field (grow from the
+    // middle out), never crossing the margin.
+    let max_x = positions
+        .iter()
+        .zip(blocks)
+        .map(|(&(x, _), block)| x + block.w)
+        .fold(0.0f32, f32::max);
+    let max_y = positions
+        .iter()
+        .zip(blocks)
+        .map(|(&(_, y), block)| y + block.h)
+        .fold(0.0f32, f32::max);
+    let dx = ((FIELD_WIDTH - (max_x - GRID_MARGIN)) / 2.0 - GRID_MARGIN).max(0.0);
+    let dy = ((FIELD_HEIGHT - (max_y - GRID_MARGIN)) / 2.0 - GRID_MARGIN).max(0.0);
+    for position in &mut positions {
+        position.0 += dx;
+        position.1 += dy;
+    }
+    positions
 }
 
 /// Row spacing for the layered layout — roomier than the grid so the
@@ -317,20 +355,29 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     #[test]
-    fn grid_is_deterministic_row_major_and_in_bounds() {
-        assert_eq!(grid_position(0), (GRID_MARGIN, GRID_MARGIN));
+    fn grid_is_deterministic_row_major_centered_and_in_bounds() {
         let cols = columns();
         assert!(cols >= 2);
-        // Second row starts below the first.
-        let (x0, y0) = grid_position(0);
-        let (x_wrap, y_wrap) = grid_position(cols);
+        // Second row starts below the first, same column.
+        let (x0, y0) = grid_position(0, 400);
+        let (x_wrap, y_wrap) = grid_position(cols, 400);
         assert_eq!(x_wrap, x0);
         assert_eq!(y_wrap, y0 + CELL_HEIGHT);
         for ix in 0..400 {
-            let (x, y) = grid_position(ix);
-            assert!(x >= 0.0 && x + NODE_WIDTH <= FIELD_WIDTH);
-            assert!(y >= 0.0 && y + NODE_HEIGHT <= FIELD_HEIGHT, "ix {ix} y {y}");
+            let (x, y) = grid_position(ix, 400);
+            assert!(x >= GRID_MARGIN && x + NODE_WIDTH <= FIELD_WIDTH);
+            assert!(
+                y >= GRID_MARGIN && y + NODE_HEIGHT <= FIELD_HEIGHT,
+                "ix {ix} y {y}"
+            );
         }
+        // The grid centers in the field: a small grid starts near the
+        // middle, not at the top-left margin.
+        let (x_small, y_small) = grid_position(0, 4);
+        assert!(x_small > FIELD_WIDTH / 4.0);
+        assert!(y_small > FIELD_HEIGHT / 4.0);
+        // Centering is count-stable per node index within one layout.
+        assert_eq!(grid_position(1, 4).1, y_small);
     }
 
     #[test]
