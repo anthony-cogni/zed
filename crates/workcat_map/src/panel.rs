@@ -113,7 +113,8 @@ impl gpui::Global for WorkcatMapHandle {}
 
 const WORKCAT_MAP_PANEL_KEY: &str = "WorkcatMapPanel";
 const DEFAULT_WIDTH: f32 = 640.;
-const MAX_LABEL_CHARS: usize = 22;
+/// ~16 words: four wrapped lines of ~30 characters.
+const MAX_LABEL_CHARS: usize = 118;
 
 pub fn init(cx: &mut App) {
     cx.observe_new(|workspace: &mut Workspace, _, _| {
@@ -1490,8 +1491,8 @@ impl WorkcatMapView {
                         let len = (dx * dx + dy * dy).sqrt().max(1.0);
                         let (ux, uy) = (dx / len, dy / len);
                         let tip = (
-                            x2 - ux * geometry::NODE_HEIGHT * zoom,
-                            y2 - uy * geometry::NODE_HEIGHT * zoom,
+                            x2 - ux * geometry::NODE_HEIGHT * 0.6 * zoom,
+                            y2 - uy * geometry::NODE_HEIGHT * 0.6 * zoom,
                         );
                         for angle in [2.6f32, -2.6] {
                             let (sin, cos) = angle.sin_cos();
@@ -1530,10 +1531,11 @@ impl WorkcatMapView {
             .top(px(node.y * zoom))
             .w(px(geometry::NODE_WIDTH * zoom))
             .h(px(geometry::NODE_HEIGHT * zoom))
-            .px_1()
-            .gap_1()
+            .px(px(6.0 * zoom))
+            .py(px(4.0 * zoom))
+            .gap(px(5.0 * zoom))
             .flex()
-            .items_center()
+            .items_start()
             .overflow_hidden()
             .rounded_sm()
             .map(|this| {
@@ -1561,6 +1563,7 @@ impl WorkcatMapView {
             .child(
                 div()
                     .flex_none()
+                    .mt(px(4.0 * zoom))
                     .w(px(8.0 * zoom))
                     .h(px(8.0 * zoom))
                     .rounded_full()
@@ -1569,6 +1572,7 @@ impl WorkcatMapView {
             .child(
                 div()
                     .text_size(px(12.5 * zoom))
+                    .line_height(px(15.5 * zoom))
                     .overflow_hidden()
                     .child(node.label.clone()),
             )

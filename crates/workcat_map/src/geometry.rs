@@ -5,17 +5,18 @@
 //! persisted position get a deterministic grid slot; every persisted
 //! `node_moved` position wins over the grid.
 
-/// Node size in logical pixels. Sized for a readable Small label
-/// (~13px UI font) with breathing room, not the cramped v1 originals.
-pub const NODE_WIDTH: f32 = 176.0;
-pub const NODE_HEIGHT: f32 = 38.0;
+/// Node size in logical pixels. Sized for ~16 words of subject: four
+/// wrapped lines of ~30 characters at a compact 12.5px/1.25 text
+/// setting, with tight margins.
+pub const NODE_WIDTH: f32 = 224.0;
+pub const NODE_HEIGHT: f32 = 76.0;
 /// The nominal field the layout scatters nodes across. Tall enough
 /// for a 400-item grid at the current cell size.
-pub const FIELD_WIDTH: f32 = 1400.0;
-pub const FIELD_HEIGHT: f32 = 4400.0;
-/// Grid cell size (node size plus gutters).
-pub const CELL_WIDTH: f32 = NODE_WIDTH + 28.0;
-pub const CELL_HEIGHT: f32 = NODE_HEIGHT + 22.0;
+pub const FIELD_WIDTH: f32 = 1600.0;
+pub const FIELD_HEIGHT: f32 = 6400.0;
+/// Grid cell size (node size plus tight gutters).
+pub const CELL_WIDTH: f32 = NODE_WIDTH + 16.0;
+pub const CELL_HEIGHT: f32 = NODE_HEIGHT + 14.0;
 /// Top-left padding before the first grid cell.
 pub const GRID_MARGIN: f32 = 16.0;
 
@@ -162,7 +163,7 @@ pub fn pack_blocks(blocks: &[Block], viewport_aspect: f32) -> Vec<(f32, f32)> {
 
 /// Row spacing for the layered layout — roomier than the grid so the
 /// dependency edges between rows read clearly.
-pub const LAYER_ROW_HEIGHT: f32 = NODE_HEIGHT + 52.0;
+pub const LAYER_ROW_HEIGHT: f32 = NODE_HEIGHT + 44.0;
 
 /// A compact layered (Sugiyama-lite) layout for one connected
 /// component: dependencies sit on lower rows than their dependents
