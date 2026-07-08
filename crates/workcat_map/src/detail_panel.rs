@@ -191,9 +191,11 @@ impl WorkcatDetailView {
         // layer-cake scans. All reading type scales with zoom.
         let zoom = self.zoom;
         let measure = px(560. * zoom);
-        let title_size = px(18.0 * zoom);
-        let meta_size = px(14.0 * zoom);
-        let heading_size = px(12.0 * zoom);
+        let title_size = px(19.0 * zoom);
+        let meta_size = px(13.0 * zoom);
+        // Quiet "eyebrow" labels: small and set apart by generous space
+        // above, so the title leads and the body copy reads as primary.
+        let heading_size = px(11.0 * zoom);
         let body_size = px(15.0 * zoom);
         let mut body = v_flex()
             .id("workcat-detail-body")
@@ -210,22 +212,35 @@ impl WorkcatDetailView {
             )
             .child(
                 h_flex()
-                    .gap_2()
-                    .pt_1()
+                    .items_center()
+                    .gap_2p5()
+                    .pt_2()
                     .text_size(meta_size)
+                    // Status as a solid pill, echoing the map's filter
+                    // pills, so the current state is the meta row's anchor.
                     .child(
-                        div()
-                            .flex_none()
-                            .w_2p5()
-                            .h_2p5()
-                            .rounded_full()
-                            .bg(status_color),
-                    )
-                    .child(
-                        div()
-                            .text_color(accent)
-                            .font_weight(gpui::FontWeight::MEDIUM)
-                            .child(SharedString::from(item.status.as_str())),
+                        h_flex()
+                            .items_center()
+                            .gap_1p5()
+                            .px_2()
+                            .py_0p5()
+                            .rounded_md()
+                            .border_1()
+                            .border_color(status_color.alpha(0.5))
+                            .bg(status_color.alpha(0.15))
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .w_2()
+                                    .h_2()
+                                    .rounded_full()
+                                    .bg(status_color),
+                            )
+                            .child(
+                                div()
+                                    .font_weight(gpui::FontWeight::MEDIUM)
+                                    .child(SharedString::from(item.status.as_str())),
+                            ),
                     )
                     .child(
                         div()
@@ -236,9 +251,20 @@ impl WorkcatDetailView {
             )
             .child(
                 div()
+                    .pt_1()
                     .text_size(px(13.0 * zoom))
                     .text_color(muted)
                     .child(item.reference.clone()),
+            )
+            // Divider closing the identity block (title/status/ref) off
+            // from the content sections below.
+            .child(
+                div()
+                    .mt_3()
+                    .w_full()
+                    .max_w(measure)
+                    .border_b_1()
+                    .border_color(colors.border_variant),
             );
         for (heading, section_body) in &item.sections {
             if heading.eq_ignore_ascii_case("notes") {
@@ -246,8 +272,8 @@ impl WorkcatDetailView {
             }
             body = body.child(
                 div()
-                    .pt_4()
-                    .pb_1()
+                    .pt_5()
+                    .pb_1p5()
                     .text_size(heading_size)
                     .font_weight(gpui::FontWeight::BOLD)
                     .text_color(accent)
@@ -270,8 +296,8 @@ impl WorkcatDetailView {
         body = body
             .child(
                 div()
-                    .pt_4()
-                    .pb_1()
+                    .pt_5()
+                    .pb_1p5()
                     .text_size(heading_size)
                     .font_weight(gpui::FontWeight::BOLD)
                     .text_color(accent)

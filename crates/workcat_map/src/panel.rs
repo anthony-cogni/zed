@@ -1606,10 +1606,17 @@ impl WorkcatMapView {
                     this.border_1().border_color(status_color.alpha(0.8))
                 }
             })
+            // Status-tinted fill in the same light language as the filter
+            // pills. We blend the tint into the opaque panel background
+            // rather than laying it on as a translucent overlay, so the
+            // fill is fully opaque: it clips the dependency edges that run
+            // beneath a node (a translucent fill let them bleed through)
+            // while staying as light as the pills. Focused/selected nodes
+            // get a slightly stronger tint.
             .bg(if focused || selected {
-                colors.element_selected
+                colors.panel_background.blend(status_color.alpha(0.32))
             } else {
-                colors.element_background
+                colors.panel_background.blend(status_color.alpha(0.16))
             })
             .cursor_grab()
             .child(
