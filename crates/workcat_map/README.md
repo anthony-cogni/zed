@@ -55,10 +55,12 @@ press `enter` or click Save), or delete the active lens. Deviation
 from the SPA: lenses do not save node positions — geometry is shared
 truth via `node_moved`.
 
-**Rect-select + group drag**: drag on empty background to draw a
-selection rectangle; nodes intersecting it are selected. Dragging any
-selected node moves the whole selection; one undo step covers the
-gesture. A plain background click clears the selection.
+**Pan, rect-select + group drag**: grabbing the empty background
+drags-to-scroll (the content follows the hand; grab/grabbing
+cursors). `shift`-dragging the background draws a selection rectangle
+instead; nodes intersecting it are selected. Dragging any selected
+node moves the whole selection; one undo step covers the gesture. A
+plain background click clears the selection.
 
 **Undo/redo**: `cmd-z` / `cmd-shift-z` while the panel has focus
 (DR-005 ruling 16: pane-focus scoped, independent of Zed's editor

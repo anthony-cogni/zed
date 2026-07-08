@@ -148,6 +148,13 @@ struct RectSelect {
     current: (f32, f32),
 }
 
+/// An in-flight background pan (drag-to-scroll) gesture, in window
+/// coordinates plus the scroll offset at gesture start.
+struct Pan {
+    pointer_start: Point<Pixels>,
+    offset_start: Point<Pixels>,
+}
+
 /// The map view. Standalone `Render`-able, needs no `Workspace`.
 pub struct WorkcatMapView {
     focus_handle: FocusHandle,
@@ -165,6 +172,7 @@ pub struct WorkcatMapView {
     selected: HashSet<String>,
     drag: Option<DragState>,
     rect_select: Option<RectSelect>,
+    pan: Option<Pan>,
     /// The field content's window-space origin, captured at paint time
     /// so background gestures can be mapped into field coordinates.
     field_origin: Rc<Cell<Point<Pixels>>>,
@@ -274,6 +282,7 @@ impl WorkcatMapView {
             selected: HashSet::new(),
             drag: None,
             rect_select: None,
+            pan: None,
             field_origin: Rc::new(Cell::new(Point::default())),
             scroll_handle: ScrollHandle::new(),
             zoom: 1.0,
@@ -441,6 +450,13 @@ impl WorkcatMapView {
 
     fn update_drag(&mut self, pointer: Point<Pixels>, cx: &mut Context<Self>) {
         let zoom = self.zoom;
+        if let Some(pan) = &self.pan {
+            // Drag-to-scroll: the content follows the hand.
+            let delta = pointer - pan.pointer_start;
+            self.scroll_handle.set_offset(pan.offset_start + delta);
+            cx.notify();
+            return;
+        }
         if let Some(rect) = &mut self.rect_select {
             let origin = self.field_origin.get();
             rect.current = (
@@ -479,6 +495,16 @@ impl WorkcatMapView {
     /// checkpoint) and records one undo step for the whole gesture. A
     /// mouse-up within the click slop is a click, which only focuses.
     fn end_drag(&mut self, cx: &mut Context<Self>) {
+        if let Some(pan) = self.pan.take() {
+            // A pan that never moved past the click slop is a plain
+            // background click: clear the selection.
+            let delta = self.scroll_handle.offset() - pan.offset_start;
+            if geometry::is_click(f32::from(delta.x), f32::from(delta.y)) {
+                self.selected.clear();
+            }
+            cx.notify();
+            return;
+        }
         if let Some(rect) = self.rect_select.take() {
             self.finish_rect_select(rect, cx);
             return;
@@ -522,32 +548,39 @@ impl WorkcatMapView {
         cx.notify();
     }
 
-    /// Background mouse-down: clear focus and start a rectangle
-    /// selection at the pointer (in field coordinates).
-    fn begin_rect_select(
+    /// Background mouse-down: shift starts a rectangle selection;
+    /// plain grab starts a pan (drag-to-scroll). Both clear focus.
+    fn begin_background_gesture(
         &mut self,
-        pointer: Point<Pixels>,
+        event: &MouseDownEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         window.focus(&self.focus_handle, cx);
         self.focused_node = None;
-        let origin = self.field_origin.get();
-        let at = (
-            f32::from(pointer.x - origin.x) / self.zoom,
-            f32::from(pointer.y - origin.y) / self.zoom,
-        );
-        self.rect_select = Some(RectSelect {
-            start: at,
-            current: at,
-        });
+        if event.modifiers.shift {
+            let origin = self.field_origin.get();
+            let at = (
+                f32::from(event.position.x - origin.x) / self.zoom,
+                f32::from(event.position.y - origin.y) / self.zoom,
+            );
+            self.rect_select = Some(RectSelect {
+                start: at,
+                current: at,
+            });
+        } else {
+            self.pan = Some(Pan {
+                pointer_start: event.position,
+                offset_start: self.scroll_handle.offset(),
+            });
+        }
         cx.notify();
     }
 
     fn finish_rect_select(&mut self, rect: RectSelect, cx: &mut Context<Self>) {
         let (dx, dy) = (rect.current.0 - rect.start.0, rect.current.1 - rect.start.1);
         if geometry::is_click(dx, dy) {
-            // A plain background click: clear the selection.
+            // A shift-click that never dragged: clear the selection.
             self.selected.clear();
             cx.notify();
             return;
@@ -567,6 +600,7 @@ impl WorkcatMapView {
         self.focused_node = None;
         self.selected.clear();
         self.rect_select = None;
+        self.pan = None;
         self.naming_lens = false;
         window.focus(&self.focus_handle, cx);
         cx.notify();
@@ -1589,10 +1623,17 @@ impl WorkcatMapView {
             .relative()
             .w(px(geometry::FIELD_WIDTH * self.zoom))
             .h(px(geometry::FIELD_HEIGHT * self.zoom))
+            .map(|this| {
+                if self.pan.is_some() {
+                    this.cursor_grabbing()
+                } else {
+                    this.cursor_grab()
+                }
+            })
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, event: &MouseDownEvent, window, cx| {
-                    this.begin_rect_select(event.position, window, cx);
+                    this.begin_background_gesture(event, window, cx);
                 }),
             )
             .on_mouse_down(
@@ -1615,7 +1656,7 @@ impl WorkcatMapView {
             content = content.child(node);
         }
         content = content.children(self.render_rect_select(cx));
-        if self.drag.is_some() || self.rect_select.is_some() {
+        if self.drag.is_some() || self.rect_select.is_some() || self.pan.is_some() {
             content = content.child(self.render_drag_listener(cx));
         }
         div()
