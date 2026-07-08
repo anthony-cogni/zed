@@ -1756,8 +1756,27 @@ impl Render for WorkcatMapView {
             self.needs_initial_fit = false;
             self.fit(&Fit, window, cx);
         }
+        // When a text input (the search box or the lens-name box) is
+        // focused, drop the bare-letter/digit bindings by switching the
+        // key context. Otherwise typing a lens name like "eda" would
+        // fire Fit/AutoArrange/Squeeze/... instead of inserting the
+        // characters. `enter`/`escape` are still bound in the input
+        // context so confirm/cancel keep working while typing.
+        let input_focused = self
+            .search_editor
+            .focus_handle(cx)
+            .contains_focused(window, cx)
+            || self
+                .lens_name_editor
+                .focus_handle(cx)
+                .contains_focused(window, cx);
+        let key_context = if input_focused {
+            "WorkcatMapInput"
+        } else {
+            "WorkcatMap"
+        };
         v_flex()
-            .key_context("WorkcatMap")
+            .key_context(key_context)
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(Self::set_status))
             .on_action(cx.listener(Self::checkpoint))

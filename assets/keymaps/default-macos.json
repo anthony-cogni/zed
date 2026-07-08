@@ -1711,6 +1711,22 @@
     },
   },
   {
+    // Active while a text input (search or lens-name box) is focused.
+    // Deliberately omits the bare-letter/digit bindings above so that
+    // typing (e.g. a lens name like "eda") inserts characters instead
+    // of firing Fit/AutoArrange/SetStatus/... It also omits cmd-z /
+    // cmd-shift-z so those undo/redo the typed text in the editor
+    // instead of a map operation. Confirm/cancel and zoom still work.
+    "context": "WorkcatMapInput",
+    "bindings": {
+      "enter": "workcat_map::ToggleDetail",
+      "escape": "workcat_map::ClearFocus",
+      "cmd-=": "workcat_map::ZoomIn",
+      "cmd--": "workcat_map::ZoomOut",
+      "cmd-0": "workcat_map::ZoomReset",
+    },
+  },
+  {
     "context": "WorkcatDetail",
     "bindings": {
       "cmd-=": "workcat_map::ZoomIn",
