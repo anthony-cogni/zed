@@ -90,6 +90,34 @@ impl Status {
     pub fn layout_rank(self) -> usize {
         ALL_STATUSES.iter().position(|s| *s == self).unwrap_or(0)
     }
+
+    /// The single most-likely forward transition, shown on the detail
+    /// panel's primary "next action" button (its verb) and applied on
+    /// click. `None` means the status is a resting end state with no
+    /// obvious next step (`Complete`) — the button is hidden. A `Some`
+    /// with a `None` target is a prompt-only action (`Unknown`
+    /// -> triage): the verb shows, but clicking opens the full status
+    /// menu instead of transitioning.
+    pub fn next_transition(self) -> Option<(&'static str, Option<Status>)> {
+        Some(match self {
+            Self::NotStarted => ("Start", Some(Self::Started)),
+            Self::Started => ("Mark implemented", Some(Self::Implemented)),
+            Self::Paused => ("Resume", Some(Self::Started)),
+            Self::Blocked => ("Unblock", Some(Self::Started)),
+            Self::Implemented => ("Mark merged", Some(Self::Merged)),
+            Self::Merged => ("Mark complete", Some(Self::Complete)),
+            Self::Complete => return None,
+            Self::Canceled => ("Reopen", Some(Self::NotStarted)),
+            Self::Unknown => ("Triage\u{2026}", None),
+        })
+    }
+
+    /// Whether this status is an off-lifecycle terminal choice
+    /// (`Canceled`, `Unknown`). The status menu draws these below a
+    /// divider, separating them from the ordinary forward flow.
+    pub fn is_terminal_choice(self) -> bool {
+        matches!(self, Self::Canceled | Self::Unknown)
+    }
 }
 
 /// One work item's metadata, parsed from its brief file.
@@ -508,6 +536,41 @@ Not started.
             assert_eq!(Status::parse(status.as_str()), Some(status));
         }
         assert_eq!(Status::parse("bogus"), None);
+    }
+
+    #[test]
+    fn next_transition_follows_the_lifecycle() {
+        assert_eq!(
+            Status::NotStarted.next_transition(),
+            Some(("Start", Some(Status::Started)))
+        );
+        assert_eq!(
+            Status::Started.next_transition(),
+            Some(("Mark implemented", Some(Status::Implemented)))
+        );
+        assert_eq!(
+            Status::Merged.next_transition(),
+            Some(("Mark complete", Some(Status::Complete)))
+        );
+        // Complete is a resting end state: no primary action.
+        assert_eq!(Status::Complete.next_transition(), None);
+        // Canceled reopens; Unknown is prompt-only (opens the menu).
+        assert_eq!(
+            Status::Canceled.next_transition(),
+            Some(("Reopen", Some(Status::NotStarted)))
+        );
+        assert_eq!(Status::Unknown.next_transition(), Some(("Triage\u{2026}", None)));
+    }
+
+    #[test]
+    fn only_canceled_and_unknown_are_terminal_choices() {
+        for status in ALL_STATUSES {
+            assert_eq!(
+                status.is_terminal_choice(),
+                matches!(status, Status::Canceled | Status::Unknown),
+                "{status:?}"
+            );
+        }
     }
 
     #[test]

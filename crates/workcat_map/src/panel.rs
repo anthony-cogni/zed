@@ -778,6 +778,25 @@ impl WorkcatMapView {
         self.fit(&Fit, window, cx);
     }
 
+    /// Scroll the field so the focused node sits at the viewport
+    /// center. Drives the detail panel's "Locate" action: the item is
+    /// already focused there, this just brings it into view on the map.
+    pub(crate) fn center_on_focused(&mut self, cx: &mut Context<Self>) {
+        let Some(node) = self.focused_node.and_then(|ix| self.nodes.get(ix)) else {
+            self.status = "no focused item to locate".into();
+            cx.notify();
+            return;
+        };
+        let viewport = self.scroll_handle.bounds().size;
+        let center_x = (node.x + geometry::NODE_WIDTH / 2.0) * self.zoom;
+        let center_y = (node.y + geometry::NODE_HEIGHT / 2.0) * self.zoom;
+        self.scroll_handle.set_offset(point(
+            px(-(center_x - f32::from(viewport.width) / 2.0).max(0.0)),
+            px(-(center_y - f32::from(viewport.height) / 2.0).max(0.0)),
+        ));
+        cx.notify();
+    }
+
     /// Scroll the field so the visible nodes' bounding box is
     /// centered in the viewport (squeeze is the "make it all fit"
     /// half, fit is the "take me there" half).
@@ -1077,7 +1096,12 @@ impl WorkcatMapView {
         }));
     }
 
-    fn set_status(&mut self, action: &SetStatus, _window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn set_status(
+        &mut self,
+        action: &SetStatus,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(status) = Status::parse(&action.status) else {
             self.status = format!("unknown status: {}", action.status).into();
             cx.notify();
