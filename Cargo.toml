@@ -6,6 +6,7 @@ members = [
     "crates/action_log",
     "crates/activity_indicator",
     "crates/agent",
+    "crates/agent_mission_control",
     "crates/agent_servers",
     "crates/agent_settings",
     "crates/agent_skills",
@@ -224,6 +225,7 @@ members = [
     "crates/web_search",
     "crates/web_search_providers",
     "crates/which_key",
+    "crates/workcat_map",
     "crates/workspace",
     "crates/worktree",
     "crates/worktree_benchmarks",
@@ -273,6 +275,7 @@ acp_thread = { path = "crates/acp_thread" }
 action_log = { path = "crates/action_log" }
 activity_indicator = { path = "crates/activity_indicator" }
 agent = { path = "crates/agent" }
+agent_mission_control = { path = "crates/agent_mission_control" }
 agent_servers = { path = "crates/agent_servers" }
 agent_settings = { path = "crates/agent_settings" }
 agent_skills = { path = "crates/agent_skills" }
@@ -485,6 +488,7 @@ which_key = { path = "crates/which_key" }
 watch = { path = "crates/watch" }
 web_search = { path = "crates/web_search" }
 web_search_providers = { path = "crates/web_search_providers" }
+workcat_map = { path = "crates/workcat_map" }
 workspace = { path = "crates/workspace" }
 worktree = { path = "crates/worktree" }
 x_ai = { path = "crates/x_ai" }

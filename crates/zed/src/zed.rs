@@ -754,6 +754,9 @@ fn initialize_panels(window: &mut Window, cx: &mut Context<Workspace>) -> Task<a
         let git_panel = GitPanel::load(workspace_handle.clone(), cx.clone());
         let channels_panel =
             collab_ui::collab_panel::CollabPanel::load(workspace_handle.clone(), cx.clone());
+        let mission_control_panel =
+            agent_mission_control::MissionControlPanel::load(workspace_handle.clone(), cx.clone());
+        let workcat_panel = workcat_map::WorkcatPanel::load(workspace_handle.clone(), cx.clone());
         let debug_panel = DebugPanel::load(workspace_handle.clone(), cx);
 
         async fn add_panel_when_ready(
@@ -778,7 +781,9 @@ fn initialize_panels(window: &mut Window, cx: &mut Context<Workspace>) -> Task<a
             add_panel_when_ready(git_panel, workspace_handle.clone(), cx.clone()),
             add_panel_when_ready(channels_panel, workspace_handle.clone(), cx.clone()),
             add_panel_when_ready(debug_panel, workspace_handle.clone(), cx.clone()),
-            initialize_agent_panel(workspace_handle, cx.clone()).map(|r| r.log_err()),
+            add_panel_when_ready(mission_control_panel, workspace_handle.clone(), cx.clone()),
+            add_panel_when_ready(workcat_panel, workspace_handle.clone(), cx.clone()),
+            initialize_agent_panel(workspace_handle.clone(), cx.clone()).map(|r| r.log_err()),
         );
 
         anyhow::Ok(())
@@ -1323,6 +1328,30 @@ fn register_actions(
     }
 
     workspace.register_action(sidebar::dump_workspace_info);
+
+    // A workcat item's `ref` is often a Zed conversation id rather than
+    // a file (the workcat_map crate has no dependency on agent
+    // internals, so its detail panel just dispatches this signal).
+    // Resolve it to an `acp::SessionId` and open it in the real agent
+    // panel: `AgentPanel::open_thread` already handles "we only have a
+    // session id" (it also backs share-link/clipboard imports), looking
+    // it up in `ThreadMetadataStore` or falling back to loading it
+    // externally by session.
+    workspace.register_action(
+        |workspace: &mut Workspace,
+         action: &workcat_map::OpenConversation,
+         window: &mut Window,
+         cx: &mut Context<Workspace>| {
+            let session_id =
+                agent_client_protocol::schema::v1::SessionId::new(action.thread_id.clone());
+            if let Some(panel) = workspace.panel::<agent_ui::AgentPanel>(cx) {
+                panel.update(cx, |panel, cx| {
+                    panel.open_thread(session_id, None, None, window, cx);
+                });
+            }
+            workspace.focus_panel::<agent_ui::AgentPanel>(window, cx);
+        },
+    );
 
     #[cfg(debug_assertions)]
     workspace.register_action(|workspace, _: &ShowWorkspaceError, _, cx| {

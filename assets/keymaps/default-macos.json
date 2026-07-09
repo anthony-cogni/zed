@@ -1685,4 +1685,54 @@
       "shift-tab": "skill_creator::FocusPreviousField",
     },
   },
+  {
+    "context": "WorkcatMap",
+    "bindings": {
+      "1": ["workcat_map::SetStatus", { "status": "not_started" }],
+      "2": ["workcat_map::SetStatus", { "status": "started" }],
+      "3": ["workcat_map::SetStatus", { "status": "paused" }],
+      "4": ["workcat_map::SetStatus", { "status": "blocked" }],
+      "5": ["workcat_map::SetStatus", { "status": "implemented" }],
+      "6": ["workcat_map::SetStatus", { "status": "merged" }],
+      "7": ["workcat_map::SetStatus", { "status": "complete" }],
+      "8": ["workcat_map::SetStatus", { "status": "canceled" }],
+      "9": ["workcat_map::SetStatus", { "status": "unknown" }],
+      "c": "workcat_map::Checkpoint",
+      "r": "workcat_map::Reload",
+      "a": "workcat_map::AutoArrange",
+      "s": "workcat_map::Squeeze",
+      "f": "workcat_map::Fit",
+      "enter": "workcat_map::ToggleDetail",
+      "cmd-z": "workcat_map::Undo",
+      "cmd-shift-z": "workcat_map::Redo",
+      "cmd-=": "workcat_map::ZoomIn",
+      "cmd--": "workcat_map::ZoomOut",
+      "cmd-0": "workcat_map::ZoomReset",
+      "escape": "workcat_map::ClearFocus",
+    },
+  },
+  {
+    // Active while a text input (search or lens-name box) is focused.
+    // Deliberately omits the bare-letter/digit bindings above so that
+    // typing (e.g. a lens name like "eda") inserts characters instead
+    // of firing Fit/AutoArrange/SetStatus/... It also omits cmd-z /
+    // cmd-shift-z so those undo/redo the typed text in the editor
+    // instead of a map operation. Confirm/cancel and zoom still work.
+    "context": "WorkcatMapInput",
+    "bindings": {
+      "enter": "workcat_map::ToggleDetail",
+      "escape": "workcat_map::ClearFocus",
+      "cmd-=": "workcat_map::ZoomIn",
+      "cmd--": "workcat_map::ZoomOut",
+      "cmd-0": "workcat_map::ZoomReset",
+    },
+  },
+  {
+    "context": "WorkcatDetail",
+    "bindings": {
+      "cmd-=": "workcat_map::ZoomIn",
+      "cmd--": "workcat_map::ZoomOut",
+      "cmd-0": "workcat_map::ZoomReset",
+    },
+  },
 ]

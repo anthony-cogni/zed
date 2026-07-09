@@ -392,6 +392,20 @@ struct GlobalThreadsDatabase(Shared<Task<Result<Arc<ThreadsDatabase>, Arc<anyhow
 
 impl Global for GlobalThreadsDatabase {}
 
+/// Overrides where the agent thread database lives, independent of
+/// `--user-data-dir`. A build running against an isolated data
+/// directory (e.g. a throwaway profile for development) can still open
+/// the user's real conversation history by pointing this at their main
+/// profile's `threads` directory, without touching any other isolated
+/// state (window layout, extensions, etc.).
+pub const THREADS_DIR_ENV_VAR: &str = "ZED_THREADS_DIR";
+
+fn threads_dir() -> PathBuf {
+    std::env::var(THREADS_DIR_ENV_VAR)
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| paths::data_dir().join("threads"))
+}
+
 impl ThreadsDatabase {
     pub fn connect(cx: &mut App) -> Shared<Task<Result<Arc<ThreadsDatabase>, Arc<anyhow::Error>>>> {
         if cx.has_global::<GlobalThreadsDatabase>() {
@@ -429,7 +443,7 @@ impl ThreadsDatabase {
                 test_name.unwrap_or_default()
             )))
         } else {
-            let threads_dir = paths::data_dir().join("threads");
+            let threads_dir = threads_dir();
             std::fs::create_dir_all(&threads_dir)?;
             let sqlite_path = threads_dir.join("threads.db");
             Connection::open_file(&sqlite_path.to_string_lossy())
