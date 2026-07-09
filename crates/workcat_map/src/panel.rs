@@ -42,6 +42,10 @@ actions!(
         /// Commits and pushes the session's pending events (write lock,
         /// fold, commit, push).
         Checkpoint,
+        /// Reloads items, positions, and lenses from workcat-db, picking
+        /// up writes made by another process (e.g. a script, or another
+        /// running instance) without needing a full window reload.
+        Reload,
         /// Clears the focused node, selection, and any pending lens
         /// naming.
         ClearFocus,
@@ -115,6 +119,10 @@ impl gpui::Global for WorkcatMapHandle {}
 const MAX_LABEL_CHARS: usize = 118;
 /// How long the map waits after the last mutation before auto-checkpointing.
 const AUTO_CHECKPOINT_DELAY: Duration = Duration::from_secs(5);
+/// How often the map polls workcat-db for external changes (another
+/// process's commit, or a script appending an event directly), so those
+/// changes surface without a full window reload.
+const AUTO_RELOAD_INTERVAL: Duration = Duration::from_secs(10);
 /// A lens with this name is applied automatically on load, so the last
 /// saved arrangement is the startup view.
 const DEFAULT_LENS: &str = "default";
@@ -209,10 +217,18 @@ pub struct WorkcatMapView {
     checkpoint_task: Option<Task<()>>,
     /// Debounced auto-checkpoint timer, reset by every mutation.
     auto_checkpoint_task: Option<Task<()>>,
+    /// True while a `reload_from_disk` background load is in flight, so
+    /// overlapping reloads (a manual Reload while the periodic timer
+    /// also fires) collapse into one.
+    reload_in_flight: bool,
     /// Apply the "default" lens once, after the first load, to restore
     /// the saved startup arrangement.
     needs_default_lens: bool,
     _load_task: Task<()>,
+    /// Self-rescheduling timer that periodically reloads from disk, so
+    /// external writes to workcat-db surface without a full window
+    /// reload. Runs until the view is dropped.
+    _auto_reload_task: Task<()>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -281,6 +297,28 @@ impl WorkcatMapView {
             .ok();
         });
 
+        // Periodically re-read workcat-db, so writes made by another
+        // process (a script appending an event directly, another
+        // running instance's checkpoint, ...) surface here without a
+        // full window reload. Skipped while a local gesture or
+        // checkpoint is in flight, so it never clobbers state that
+        // hasn't settled yet; the next tick picks it up instead.
+        let auto_reload_task = cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(AUTO_RELOAD_INTERVAL).await;
+                let alive = this
+                    .update(cx, |this, cx| {
+                        if this.drag.is_none() && this.pan.is_none() && !this.checkpoint_running {
+                            this.spawn_reload(cx);
+                        }
+                    })
+                    .is_ok();
+                if !alive {
+                    break;
+                }
+            }
+        });
+
         Self {
             focus_handle,
             items: Vec::new(),
@@ -312,10 +350,81 @@ impl WorkcatMapView {
             append_task: None,
             checkpoint_task: None,
             auto_checkpoint_task: None,
+            reload_in_flight: false,
             needs_default_lens: true,
             _load_task: load_task,
+            _auto_reload_task: auto_reload_task,
             _subscriptions: subscriptions,
         }
+    }
+
+    /// Re-read items, positions, and lenses from workcat-db on the
+    /// background executor and apply them, collapsing overlapping
+    /// requests (a manual Reload firing while the periodic timer is
+    /// also mid-flight) into one. Node positions merge in exactly as
+    /// `apply_loaded` does for the initial load: freshly persisted
+    /// coordinates win, and anything with no persisted position yet
+    /// keeps its current (possibly grid-assigned) spot until the next
+    /// `rebuild_scene`.
+    fn spawn_reload(&mut self, cx: &mut Context<Self>) {
+        if self.reload_in_flight {
+            return;
+        }
+        self.reload_in_flight = true;
+        cx.spawn(async move |this, cx| {
+            let loaded = cx
+                .background_spawn(async move {
+                    let db = store::resolve_db_dir();
+                    let items = store::load_items(&db)?;
+                    let positions = store::load_positions(&db)?;
+                    let lenses = store::load_lenses(&db)?;
+                    anyhow::Ok((items, positions, lenses))
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                this.reload_in_flight = false;
+                match loaded {
+                    Ok((items, positions, lenses)) => {
+                        this.lenses = lenses;
+                        this.apply_loaded(items, positions, cx);
+                        // `apply_loaded`'s positions come only from
+                        // `node_moved` events; a lens's own saved
+                        // positions (from `lens_saved`) are a separate
+                        // fold, merged in by `apply_lens`. Re-merge the
+                        // active lens's freshly reloaded positions here
+                        // too, or an external edit to the active lens
+                        // (e.g. a script writing a `lens_saved` event)
+                        // would reload everything else but leave this
+                        // lens's geometry stale until the next manual
+                        // re-apply.
+                        if let Some(name) = this.active_lens.clone()
+                            && let Some(lens) = this.lenses.get(&name)
+                        {
+                            for (id, x, y) in &lens.positions {
+                                this.positions.insert(id.clone(), (*x, *y));
+                            }
+                            this.rebuild_scene();
+                        }
+                    }
+                    Err(error) => {
+                        log::error!("workcat_map: reload failed: {error:#}");
+                        this.status = format!("reload failed: {error:#}").into();
+                        cx.notify();
+                    }
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// The manual Reload action (`r` in the `WorkcatMap` context, and
+    /// the background context menu): same background load as the
+    /// periodic timer, triggered on demand.
+    fn reload(&mut self, _: &Reload, _window: &mut Window, cx: &mut Context<Self>) {
+        self.status = "reloading workcat-db...".into();
+        cx.notify();
+        self.spawn_reload(cx);
     }
 
     fn apply_loaded(
@@ -1017,7 +1126,12 @@ impl WorkcatMapView {
 
     /// Overwrite the active lens in place (the "Save" affordance). With
     /// no active lens, nothing to update — use "+" to create one.
-    fn save_active_lens(&mut self, _: &SaveActiveLens, _window: &mut Window, cx: &mut Context<Self>) {
+    fn save_active_lens(
+        &mut self,
+        _: &SaveActiveLens,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(name) = self.active_lens.clone() else {
             self.status = "no active lens \u{2014} use + to create one".into();
             cx.notify();
@@ -1169,9 +1283,7 @@ impl WorkcatMapView {
     /// streams into the status line as before.
     fn arm_auto_checkpoint(&mut self, cx: &mut Context<Self>) {
         self.auto_checkpoint_task = Some(cx.spawn(async move |this, cx| {
-            cx.background_executor()
-                .timer(AUTO_CHECKPOINT_DELAY)
-                .await;
+            cx.background_executor().timer(AUTO_CHECKPOINT_DELAY).await;
             this.update(cx, |this, cx| {
                 if this.pending_events > 0 && !this.checkpoint_running {
                     this.spawn_checkpoint(None, "auto checkpoint".into(), cx);
@@ -1377,6 +1489,7 @@ impl WorkcatMapView {
             }
             menu.separator()
                 .action("Checkpoint Now", Box::new(Checkpoint))
+                .action("Reload", Box::new(Reload))
         });
         self.show_context_menu(context_menu, position, window, cx);
     }
@@ -1558,7 +1671,9 @@ impl WorkcatMapView {
                 row.child(
                     Button::new("save-active-lens", "Save")
                         .label_size(LabelSize::Small)
-                        .tooltip(ui::Tooltip::text(format!("Update lens \u{201c}{active}\u{201d}")))
+                        .tooltip(ui::Tooltip::text(format!(
+                            "Update lens \u{201c}{active}\u{201d}"
+                        )))
                         .on_click(cx.listener(|this, _, window, cx| {
                             this.save_active_lens(&SaveActiveLens, window, cx);
                         })),
@@ -1567,7 +1682,9 @@ impl WorkcatMapView {
             .child(
                 Button::new("new-lens", "+")
                     .label_size(LabelSize::Small)
-                    .tooltip(ui::Tooltip::text("New lens from the current filter and layout"))
+                    .tooltip(ui::Tooltip::text(
+                        "New lens from the current filter and layout",
+                    ))
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.save_lens_prompt(&SaveLensPrompt, window, cx);
                     })),
@@ -1576,60 +1693,63 @@ impl WorkcatMapView {
             let visible = self.filter.visible_statuses.contains(&status);
             let count = counts.get(&status).copied().unwrap_or(0);
             let status_color = Self::status_color(status);
-            row = row.child(
-                h_flex()
-                    .id(SharedString::from(format!("chip-{}", status.as_str())))
-                    .px_1p5()
-                    .py_0p5()
-                    .gap_1p5()
-                    .rounded_md()
-                    .border_1()
-                    .cursor_pointer()
-                    // Zero-count lenses read as dimmed but stay clickable.
-                    .opacity(if count == 0 { 0.45 } else { 1.0 })
-                    .border_color(if visible {
-                        status_color.alpha(0.9)
-                    } else {
-                        colors.border_variant
-                    })
-                    .bg(if visible {
-                        status_color.alpha(0.15)
-                    } else {
-                        colors.element_background
-                    })
-                    .tooltip(ui::Tooltip::text(format!(
-                        "{} \u{2014} click to {}",
-                        status.label(),
-                        if visible { "hide" } else { "show" }
-                    )))
-                    .child(
-                        div()
-                            .flex_none()
-                            .w_2()
-                            .h_2()
-                            .rounded_full()
-                            .bg(status_color),
-                    )
-                    // Dot + humanized name + count; the row doubles as
-                    // the map's status legend.
-                    .child(
-                        Label::new(status.label())
-                            .size(LabelSize::Small)
-                            .color(if visible { Color::Default } else { Color::Muted }),
-                    )
-                    .child(
-                        Label::new(format!("{count}"))
-                            .size(LabelSize::Small)
-                            .color(Color::Muted),
-                    )
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
-                            this.toggle_status_filter(status, cx);
-                            cx.stop_propagation();
-                        }),
-                    ),
-            );
+            row =
+                row.child(
+                    h_flex()
+                        .id(SharedString::from(format!("chip-{}", status.as_str())))
+                        .px_1p5()
+                        .py_0p5()
+                        .gap_1p5()
+                        .rounded_md()
+                        .border_1()
+                        .cursor_pointer()
+                        // Zero-count lenses read as dimmed but stay clickable.
+                        .opacity(if count == 0 { 0.45 } else { 1.0 })
+                        .border_color(if visible {
+                            status_color.alpha(0.9)
+                        } else {
+                            colors.border_variant
+                        })
+                        .bg(if visible {
+                            status_color.alpha(0.15)
+                        } else {
+                            colors.element_background
+                        })
+                        .tooltip(ui::Tooltip::text(format!(
+                            "{} \u{2014} click to {}",
+                            status.label(),
+                            if visible { "hide" } else { "show" }
+                        )))
+                        .child(
+                            div()
+                                .flex_none()
+                                .w_2()
+                                .h_2()
+                                .rounded_full()
+                                .bg(status_color),
+                        )
+                        // Dot + humanized name + count; the row doubles as
+                        // the map's status legend.
+                        .child(Label::new(status.label()).size(LabelSize::Small).color(
+                            if visible {
+                                Color::Default
+                            } else {
+                                Color::Muted
+                            },
+                        ))
+                        .child(
+                            Label::new(format!("{count}"))
+                                .size(LabelSize::Small)
+                                .color(Color::Muted),
+                        )
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
+                                this.toggle_status_filter(status, cx);
+                                cx.stop_propagation();
+                            }),
+                        ),
+                );
         }
         if self.naming_lens {
             row = row
@@ -1999,6 +2119,7 @@ impl Render for WorkcatMapView {
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(Self::set_status))
             .on_action(cx.listener(Self::checkpoint))
+            .on_action(cx.listener(Self::reload))
             .on_action(cx.listener(Self::clear_focus))
             .on_action(cx.listener(Self::undo))
             .on_action(cx.listener(Self::redo))

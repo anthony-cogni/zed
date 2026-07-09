@@ -1698,6 +1698,7 @@
       "8": ["workcat_map::SetStatus", { "status": "canceled" }],
       "9": ["workcat_map::SetStatus", { "status": "unknown" }],
       "c": "workcat_map::Checkpoint",
+      "r": "workcat_map::Reload",
       "a": "workcat_map::AutoArrange",
       "s": "workcat_map::Squeeze",
       "f": "workcat_map::Fit",
