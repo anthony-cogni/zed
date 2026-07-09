@@ -2,20 +2,19 @@
 //! surface for the map's focused item. It renders the brief as the
 //! design mockup: title, a status pill that is the *only* status
 //! control (it opens the shared "Set status" menu), Open handoff /
-//! Locate actions, one handoff context chip, an editable Hazards list
-//! (with the Blocked-on flow), and an autosaving Notes field, over a
-//! footer with the dependency count and last-updated time.
+//! Locate actions, one handoff context chip (a copy-able id), and an
+//! autosaving Notes field, over a footer with the dependency count and
+//! last-updated time.
 //!
 //! The map panel stays the gesture surface; this panel is where a brief
 //! is read and its status is advanced. They communicate through a
 //! `WorkcatMapHandle` global: the map view registers itself there, and
 //! this panel observes the map entity, re-rendering on every
-//! focus/mutation notify. Status changes, notes, and hazards all flow
-//! back through the map view, keeping the event-append path and the
-//! pending-events counter in one place. Status *side effects* (the
-//! Blocked prompt, the Canceled undo, the Unknown triage note) are
-//! driven off the observed status transition, so they fire no matter
-//! which surface changed the status.
+//! focus/mutation notify. Status changes and notes flow back through
+//! the map view, keeping the event-append path and the pending-events
+//! counter in one place. Status *side effects* (the Canceled undo, the
+//! Unknown triage note) are driven off the observed status transition,
+//! so they fire no matter which surface changed the status.
 
 use std::time::Duration;
 
@@ -52,8 +51,6 @@ const DETAIL_WIDTH_FRACTION: f32 = 0.22;
 const AUTOSAVE_DELAY: Duration = Duration::from_millis(700);
 /// How long the "Marked as canceled" undo affordance stays offered.
 const CANCEL_UNDO_WINDOW: Duration = Duration::from_secs(6);
-/// Prefix marking a hazard as a Blocked-on record (cleared on unblock).
-const BLOCKED_ON_PREFIX: &str = "Blocked on:";
 
 pub fn init(cx: &mut App) {
     cx.observe_new(|workspace: &mut Workspace, _, _| {
@@ -81,9 +78,6 @@ pub struct WorkcatDetailView {
     /// transition (from any surface) can trigger its side effects once.
     tracked_item: Option<String>,
     tracked_status: Option<Status>,
-    /// The Blocked-on reason input, shown after a change to Blocked.
-    blocked_editor: Entity<Editor>,
-    blocked_prompt: bool,
     /// The status to restore while the Canceled undo window is open.
     undo_prev: Option<Status>,
     undo_task: Option<Task<()>>,
@@ -106,15 +100,6 @@ impl WorkcatDetailView {
         let notes_editor = cx.new(|cx| {
             let mut editor = Editor::auto_height(1, 8, window, cx);
             editor.set_placeholder_text("Add a note\u{2026}", window, cx);
-            editor
-        });
-        let blocked_editor = cx.new(|cx| {
-            let mut editor = Editor::single_line(window, cx);
-            editor.set_placeholder_text(
-                "Blocked on\u{2026} (work item, thread, or person)",
-                window,
-                cx,
-            );
             editor
         });
         // The map panel may register its handle before or after this
@@ -162,8 +147,6 @@ impl WorkcatDetailView {
             autosave_task: None,
             tracked_item: None,
             tracked_status: None,
-            blocked_editor,
-            blocked_prompt: false,
             undo_prev: None,
             undo_task: None,
             status: SharedString::default(),
@@ -230,14 +213,13 @@ impl WorkcatDetailView {
     }
 
     /// Reconcile transient UI to the focused item, and fire the side
-    /// effects of a status transition once (Blocked prompt, Canceled
-    /// undo, Unknown triage note, unblock clears Blocked-on hazards).
+    /// effects of a status transition once (Canceled undo, Unknown
+    /// triage note).
     fn sync_focused(&mut self, item: Option<&ItemMeta>, cx: &mut Context<Self>) {
         let new_id = item.map(|item| item.id.as_str());
         if self.tracked_item.as_deref() != new_id {
             self.tracked_item = new_id.map(str::to_string);
             self.tracked_status = item.map(|item| item.status);
-            self.blocked_prompt = false;
             self.undo_prev = None;
             self.status = SharedString::default();
             return;
@@ -248,14 +230,7 @@ impl WorkcatDetailView {
         }
         let prev = self.tracked_status;
         self.tracked_status = new_status;
-        if prev == Some(Status::Blocked) && new_status != Some(Status::Blocked) {
-            self.blocked_prompt = false;
-            if let Some(item) = item {
-                self.clear_blocked_hazards(item, cx);
-            }
-        }
         match new_status {
-            Some(Status::Blocked) => self.blocked_prompt = true,
             Some(Status::Canceled) => self.show_undo_banner(prev, cx),
             Some(Status::Unknown) => self.status = "Flagged for triage".into(),
             _ => {}
@@ -340,14 +315,22 @@ impl WorkcatDetailView {
         }
     }
 
-    /// Open the focused item's `ref` (its handoff doc) in the editor,
-    /// resolving it against each visible worktree root. Falls back to a
-    /// status message when the reference is not inside the project.
+    /// Open the focused item's `ref`. Most refs are a file path (a
+    /// handoff doc) resolved against the visible worktrees and opened in
+    /// the editor; the rest are a Zed conversation id (a bare uuid),
+    /// which has no file, so we copy it for now (a dedicated conversation
+    /// viewer panel is a follow-up).
     fn open_reference(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(item) = self.focused_item(cx) else {
             return;
         };
         let reference = item.reference;
+        if is_conversation_ref(&reference) {
+            cx.write_to_clipboard(gpui::ClipboardItem::new_string(reference.clone()));
+            self.status = format!("conversation id copied: {}", short_id(&reference)).into();
+            cx.notify();
+            return;
+        }
         let Some(workspace) = self.workspace.upgrade() else {
             self.status = "workspace unavailable".into();
             cx.notify();
@@ -383,60 +366,22 @@ impl WorkcatDetailView {
         cx.notify();
     }
 
-    // === Hazards (editable Hazards section) ===
-
-    /// Persist a new hazards list for `item`, replacing the whole
-    /// `## Hazards` section through the map (event-sourced, like notes).
-    fn save_hazards(&mut self, item_id: &str, hazards: Vec<String>, cx: &mut Context<Self>) {
-        if let Some(map) = self.map() {
-            let id = item_id.to_string();
-            map.update(cx, |map, cx| {
-                map.save_section_for(&id, "Hazards", hazards.join("\n"), cx)
-            });
-        }
-    }
-
-    fn remove_hazard(&mut self, index: usize, cx: &mut Context<Self>) {
+    /// Copy the focused item's full id to the clipboard.
+    fn copy_id(&mut self, cx: &mut Context<Self>) {
         let Some(item) = self.focused_item(cx) else {
             return;
         };
-        let mut hazards = hazard_lines(&item);
-        if index >= hazards.len() {
-            return;
-        }
-        hazards.remove(index);
-        self.save_hazards(&item.id, hazards, cx);
-    }
-
-    /// Drop any `Blocked on:` hazards; used when leaving Blocked.
-    fn clear_blocked_hazards(&mut self, item: &ItemMeta, cx: &mut Context<Self>) {
-        let hazards = hazard_lines(item);
-        let kept: Vec<String> = hazards
-            .iter()
-            .filter(|hazard| !hazard.starts_with(BLOCKED_ON_PREFIX))
-            .cloned()
-            .collect();
-        if kept.len() != hazards.len() {
-            let id = item.id.clone();
-            self.save_hazards(&id, kept, cx);
-        }
-    }
-
-    fn save_blocked_reason(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let reason = self.blocked_editor.read(cx).text(cx).trim().to_string();
-        self.blocked_prompt = false;
-        self.blocked_editor.update(cx, |editor, cx| {
-            editor.set_text("", window, cx);
-        });
-        if reason.is_empty() {
-            cx.notify();
-            return;
-        }
-        if let Some(item) = self.focused_item(cx) {
-            let mut hazards = hazard_lines(&item);
-            hazards.push(format!("{BLOCKED_ON_PREFIX} {reason}"));
-            self.save_hazards(&item.id, hazards, cx);
-        }
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string(item.id.clone()));
+        // Confirm by reading it back, so a failed copy says so.
+        let copied = cx
+            .read_from_clipboard()
+            .and_then(|entry| entry.text())
+            .is_some_and(|text| text == item.id);
+        self.status = if copied {
+            format!("\u{2713} Copied {}", item.id8()).into()
+        } else {
+            "Copy failed".into()
+        };
         cx.notify();
     }
 
@@ -531,6 +476,12 @@ impl WorkcatDetailView {
 
     fn render_context_chip(&self, reference: &str, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = cx.theme().colors().clone();
+        let conversation = is_conversation_ref(reference);
+        let (glyph, label) = if conversation {
+            ("\u{1f4ac}", format!("conversation {}", short_id(reference)))
+        } else {
+            ("\u{1f4c4}", shorten_reference(reference))
+        };
         h_flex()
             .id("workcat-context-chip")
             .w_full()
@@ -545,102 +496,19 @@ impl WorkcatDetailView {
             .cursor_pointer()
             .hover(|this| this.border_color(colors.border_focused))
             .tooltip(Tooltip::text(reference.to_string()))
-            .child(div().child("\u{1f4c4}"))
+            .child(div().child(glyph))
             .child(
                 div()
                     .flex_1()
                     .text_size(px(12.0))
                     .text_color(colors.text_accent)
                     .overflow_hidden()
-                    .child(shorten_reference(reference)),
+                    .child(label),
             )
             .child(div().text_color(colors.text_muted).child("\u{2197}"))
             .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
                 this.open_reference(window, cx);
             }))
-    }
-
-    fn render_hazards(&self, item: &ItemMeta, zoom: f32, cx: &mut Context<Self>) -> impl IntoElement {
-        let muted = cx.theme().colors().text_muted;
-        let colors = cx.theme().colors().clone();
-        let hazard_color = WorkcatMapView::status_color(Status::Blocked);
-        let hazards = hazard_lines(item);
-        let mut section = v_flex().child(section_label("Hazards", muted, px(10.5 * zoom)));
-        if self.blocked_prompt {
-            section = section.child(
-                h_flex()
-                    .mt_1()
-                    .gap_2()
-                    .items_center()
-                    .child(
-                        div()
-                            .flex_1()
-                            .px_2()
-                            .py_1()
-                            .rounded_md()
-                            .border_1()
-                            .border_color(colors.border_variant)
-                            .bg(colors.editor_background)
-                            .child(self.blocked_editor.clone()),
-                    )
-                    .child(
-                        Button::new("workcat-blocked-save", "Save")
-                            .style(ButtonStyle::Outlined)
-                            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
-                                this.save_blocked_reason(window, cx);
-                            })),
-                    )
-                    .child(
-                        Button::new("workcat-blocked-skip", "Skip")
-                            .style(ButtonStyle::Outlined)
-                            .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
-                                this.blocked_prompt = false;
-                                cx.notify();
-                            })),
-                    ),
-            );
-        }
-        if hazards.is_empty() {
-            // Empty state is the least prominent element: muted, no
-            // icon, no red.
-            return section.child(
-                div()
-                    .text_size(px(12.5 * zoom))
-                    .text_color(muted)
-                    .child("No hazards recorded"),
-            );
-        }
-        for (index, hazard) in hazards.into_iter().enumerate() {
-            section = section.child(
-                h_flex()
-                    .mt_1()
-                    .gap_2()
-                    .items_start()
-                    .px_2()
-                    .py_1()
-                    .rounded_md()
-                    .border_1()
-                    .border_color(hazard_color.alpha(0.35))
-                    .bg(hazard_color.alpha(0.1))
-                    .child(div().flex_none().text_color(hazard_color).child("\u{26a0}"))
-                    .child(div().flex_1().text_size(px(13.0 * zoom)).child(hazard))
-                    .child(
-                        div()
-                            .id(SharedString::from(format!("workcat-hazard-remove-{index}")))
-                            .flex_none()
-                            .px_1()
-                            .text_color(muted)
-                            .cursor_pointer()
-                            .hover(|this| this.text_color(hazard_color))
-                            .tooltip(Tooltip::text("Remove hazard"))
-                            .child("\u{00d7}")
-                            .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
-                                this.remove_hazard(index, cx);
-                            })),
-                    ),
-            );
-        }
-        section
     }
 
     fn render_body(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
@@ -691,8 +559,13 @@ impl WorkcatDetailView {
                         .id("workcat-hash")
                         .text_size(px(12.0 * zoom))
                         .text_color(accent)
-                        .tooltip(Tooltip::text(item.id.clone()))
-                        .child(item.id8().to_string()),
+                        .cursor_pointer()
+                        .hover(|this| this.text_color(accent.opacity(0.7)))
+                        .tooltip(Tooltip::text("Click to copy full id"))
+                        .child(item.id8().to_string())
+                        .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                            this.copy_id(cx);
+                        })),
                 ),
         );
 
@@ -729,9 +602,6 @@ impl WorkcatDetailView {
                 .child(section_label("Context", muted, px(10.5 * zoom)))
                 .child(self.render_context_chip(&item.reference, cx)),
         );
-
-        // Hazards.
-        body = body.child(self.render_hazards(&item, zoom, cx));
 
         // Notes: an autosaving field with a status/save line.
         body = body
@@ -796,19 +666,15 @@ fn section_label(text: &str, color: Hsla, size: Pixels) -> Div {
         .child(text.to_uppercase())
 }
 
-/// The focused item's hazards, one per non-empty line of its `##
-/// Hazards` section (bullet markers stripped).
-fn hazard_lines(item: &ItemMeta) -> Vec<String> {
-    item.sections
-        .iter()
-        .find(|(heading, _)| heading.eq_ignore_ascii_case("hazards"))
-        .map(|(_, body)| {
-            body.lines()
-                .map(|line| line.trim().trim_start_matches("- ").trim().to_string())
-                .filter(|line| !line.is_empty())
-                .collect()
-        })
-        .unwrap_or_default()
+/// A `ref` that is a bare Zed conversation id (a uuid) rather than a
+/// file path: no path separator and not a markdown doc.
+fn is_conversation_ref(reference: &str) -> bool {
+    !reference.contains('/') && !reference.ends_with(".md")
+}
+
+/// First 8 chars of an id, for compact display.
+fn short_id(id: &str) -> &str {
+    &id[..id.len().min(8)]
 }
 
 /// Elide the middle of a path so a long `ref` fits on one line

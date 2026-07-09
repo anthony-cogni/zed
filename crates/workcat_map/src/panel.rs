@@ -73,8 +73,12 @@ actions!(
         ZoomReset,
         /// Resets filters and search to the default scope.
         ClearFilter,
-        /// Starts naming a lens to save the current filter as.
+        /// Starts naming a new lens (the "+" affordance) to save the
+        /// current filter and layout as.
         SaveLensPrompt,
+        /// Saves the current filter and layout into the active lens,
+        /// overwriting it in place (no name prompt).
+        SaveActiveLens,
         /// Confirms the lens name being typed.
         ConfirmLensName,
     ]
@@ -954,6 +958,7 @@ impl WorkcatMapView {
             cx.notify();
             return;
         };
+        let lens = lens.clone();
         self.filter = lens.to_filter();
         let query = self.filter.query.clone();
         self.active_lens = Some(action.name.clone());
@@ -963,8 +968,61 @@ impl WorkcatMapView {
         // Setting editor text re-fires BufferEdited, which clears
         // active_lens; restore it after.
         self.active_lens = Some(action.name.clone());
+        // Restore the lens's saved geometry: a lens organizes a
+        // workstream by layout as well as filter. Older lenses saved no
+        // positions, so this is a no-op for them.
+        for (id, x, y) in &lens.positions {
+            self.positions.insert(id.clone(), (*x, *y));
+        }
         self.rebuild_scene();
         self.status = format!("lens: {}", action.name).into();
+        cx.notify();
+    }
+
+    /// All currently-visible nodes' geometry, snapshotted into a lens.
+    fn current_positions(&self) -> Vec<(String, f32, f32)> {
+        self.nodes
+            .iter()
+            .map(|node| (self.items[node.item_ix].id.clone(), node.x, node.y))
+            .collect()
+    }
+
+    /// Save the current filter + query + layout under `name`, appending
+    /// a `lens_saved` event and folding it in memory (last-write-wins).
+    fn save_lens(&mut self, name: String, cx: &mut Context<Self>) {
+        let visible: Vec<&str> = ALL_STATUSES
+            .iter()
+            .filter(|status| self.filter.visible_statuses.contains(status))
+            .map(|status| status.as_str())
+            .collect();
+        let query = self.filter.query.trim().to_string();
+        let positions = self.current_positions();
+        self.append_to_log(
+            store::lens_saved_event(&name, &visible, &query, &positions),
+            cx,
+        );
+        self.lenses.insert(
+            name.clone(),
+            Lens {
+                name: name.clone(),
+                visible_statuses: visible.iter().map(|s| s.to_string()).collect(),
+                query,
+                positions,
+            },
+        );
+        self.active_lens = Some(name.clone());
+        self.status = format!("saved lens {name}").into();
+    }
+
+    /// Overwrite the active lens in place (the "Save" affordance). With
+    /// no active lens, nothing to update — use "+" to create one.
+    fn save_active_lens(&mut self, _: &SaveActiveLens, _window: &mut Window, cx: &mut Context<Self>) {
+        let Some(name) = self.active_lens.clone() else {
+            self.status = "no active lens \u{2014} use + to create one".into();
+            cx.notify();
+            return;
+        };
+        self.save_lens(name, cx);
         cx.notify();
     }
 
@@ -1004,28 +1062,12 @@ impl WorkcatMapView {
             cx.notify();
             return;
         }
-        let visible: Vec<&str> = ALL_STATUSES
-            .iter()
-            .filter(|status| self.filter.visible_statuses.contains(status))
-            .map(|status| status.as_str())
-            .collect();
-        let query = self.filter.query.trim().to_string();
-        self.append_to_log(store::lens_saved_event(&name, &visible, &query), cx);
-        self.lenses.insert(
-            name.clone(),
-            Lens {
-                name: name.clone(),
-                visible_statuses: visible.iter().map(|s| s.to_string()).collect(),
-                query,
-            },
-        );
-        self.active_lens = Some(name.clone());
+        self.save_lens(name, cx);
         self.naming_lens = false;
         self.lens_name_editor.update(cx, |editor, cx| {
             editor.set_text("", window, cx);
         });
         window.focus(&self.focus_handle, cx);
-        self.status = format!("saved lens {name}").into();
         cx.notify();
     }
 
@@ -1297,7 +1339,12 @@ impl WorkcatMapView {
                 };
                 menu = menu.action(label, Box::new(ApplyLens { name: name.clone() }));
             }
-            menu = menu.action("Save Lens\u{2026}", Box::new(SaveLensPrompt));
+            // "Save" overwrites the active lens in place; "New lens..."
+            // (the "+") creates one. With no active lens, only New.
+            if let Some(active) = &active_lens {
+                menu = menu.action(format!("Save {active}"), Box::new(SaveActiveLens));
+            }
+            menu = menu.action("New lens\u{2026}", Box::new(SaveLensPrompt));
             if let Some(active) = &active_lens {
                 menu = menu.action(
                     format!("Delete Lens {active}"),
@@ -1479,6 +1526,26 @@ impl WorkcatMapView {
                     ))
                     .on_click(cx.listener(|this, event: &gpui::ClickEvent, window, cx| {
                         this.deploy_background_menu(event.position(), window, cx);
+                    })),
+            )
+            // "Save" updates the active lens (filter + layout); the "+"
+            // creates a new one. Save only shows with an active lens.
+            .when_some(self.active_lens.clone(), |row, active| {
+                row.child(
+                    Button::new("save-active-lens", "Save")
+                        .label_size(LabelSize::Small)
+                        .tooltip(ui::Tooltip::text(format!("Update lens \u{201c}{active}\u{201d}")))
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.save_active_lens(&SaveActiveLens, window, cx);
+                        })),
+                )
+            })
+            .child(
+                Button::new("new-lens", "+")
+                    .label_size(LabelSize::Small)
+                    .tooltip(ui::Tooltip::text("New lens from the current filter and layout"))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.save_lens_prompt(&SaveLensPrompt, window, cx);
                     })),
             );
         for status in ALL_STATUSES {
@@ -1907,6 +1974,7 @@ impl Render for WorkcatMapView {
             .on_action(cx.listener(Self::apply_lens))
             .on_action(cx.listener(Self::delete_lens))
             .on_action(cx.listener(Self::save_lens_prompt))
+            .on_action(cx.listener(Self::save_active_lens))
             .on_action(cx.listener(Self::confirm_lens_name))
             .size_full()
             .bg(cx.theme().colors().panel_background)

@@ -142,7 +142,16 @@ pub fn brief_edited_event(id: &str, section: &str, text: &str) -> serde_json::Va
     })
 }
 
-pub fn lens_saved_event(name: &str, visible_statuses: &[&str], query: &str) -> serde_json::Value {
+pub fn lens_saved_event(
+    name: &str,
+    visible_statuses: &[&str],
+    query: &str,
+    positions: &[(String, f32, f32)],
+) -> serde_json::Value {
+    let positions: Vec<serde_json::Value> = positions
+        .iter()
+        .map(|(id, x, y)| serde_json::json!({ "id": id, "x": x, "y": y }))
+        .collect();
     serde_json::json!({
         "ts": timestamp(),
         "actor": ACTOR,
@@ -150,6 +159,7 @@ pub fn lens_saved_event(name: &str, visible_statuses: &[&str], query: &str) -> s
         "name": name,
         "visible_statuses": visible_statuses,
         "query": query,
+        "positions": positions,
     })
 }
 
@@ -247,6 +257,36 @@ async fn acquire_lock(db: &Path, progress: &Progress) -> Result<()> {
     unreachable!()
 }
 
+/// Restore the stashed pending appends without `git stash pop`, which
+/// conflicts whenever a concurrent append landed on the log during the
+/// checkpoint. Instead reconstruct each stashed event file as the
+/// append-only union of the committed (post-pull) log, the current
+/// working tree, and the stash, then drop the stash. Append-only +
+/// content de-dup means this can never conflict.
+async fn restore_stashed_appends(db: &Path) -> Result<()> {
+    let files = run_ok(db, "git", &["stash", "show", "--name-only", "stash@{0}"]).await?;
+    for file in files.lines() {
+        let file = file.trim();
+        if file.is_empty() {
+            continue;
+        }
+        let committed = run(db, "git", &["show", &format!("HEAD:{file}")])
+            .await
+            .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
+            .unwrap_or_default();
+        let stash = run(db, "git", &["show", &format!("stash@{{0}}:{file}")])
+            .await
+            .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
+            .unwrap_or_default();
+        let working = std::fs::read_to_string(db.join(file)).unwrap_or_default();
+        let merged = model::merge_append_log(&committed, &working, &stash);
+        std::fs::write(db.join(file), merged)
+            .with_context(|| format!("writing merged {file}"))?;
+    }
+    run_ok(db, "git", &["stash", "drop", "stash@{0}"]).await?;
+    Ok(())
+}
+
 async fn release_lock(db: &Path) -> Result<()> {
     run_ok(
         db,
@@ -264,8 +304,9 @@ async fn release_lock(db: &Path) -> Result<()> {
 ///
 /// Uncommitted event appends made since the last checkpoint are
 /// stashed across the lock acquire (whose `git pull --rebase` needs a
-/// clean tree) and restored before folding, keeping appends
-/// append-only relative to anything pulled.
+/// clean tree), then restored by an append-only union merge (not
+/// `git stash pop`, which conflicts and strands events when a
+/// concurrent append lands on the log during the checkpoint window).
 pub async fn checkpoint(db: &Path, message: &str, progress: &Progress) -> Result<Option<String>> {
     let stashed = if events_dirty(db).await? {
         report(progress, "stashing pending events...");
@@ -290,7 +331,7 @@ pub async fn checkpoint(db: &Path, message: &str, progress: &Progress) -> Result
     report(progress, "acquiring write lock...");
     if let Err(error) = acquire_lock(db, progress).await {
         if stashed {
-            run_ok(db, "git", &["stash", "pop"]).await.ok();
+            restore_stashed_appends(db).await.ok();
         }
         return Err(error);
     }
@@ -314,14 +355,12 @@ async fn checkpoint_locked(
     progress: &Progress,
 ) -> Result<Option<String>> {
     if stashed {
-        run_ok(db, "git", &["stash", "pop"])
-            .await
-            .map_err(|error| {
-                anyhow!(
-                    "restoring pending events failed (they are safe in `git stash`; \
+        restore_stashed_appends(db).await.map_err(|error| {
+            anyhow!(
+                "restoring pending events failed (they are safe in `git stash`; \
                  resolve by hand in the db repo): {error}"
-                )
-            })?;
+            )
+        })?;
     }
     if !events_dirty(db).await? {
         return Ok(None);
@@ -413,11 +452,18 @@ mod tests {
         assert_eq!(ev["kind"], "brief_edited");
         assert_eq!(ev["section"], "Notes");
         assert_eq!(ev["text"], "note body");
-        let ev = lens_saved_event("mine", &["started", "blocked"], "eda");
+        let ev = lens_saved_event(
+            "mine",
+            &["started", "blocked"],
+            "eda",
+            &[("id-a".to_string(), 1.0, 2.0)],
+        );
         assert_eq!(ev["kind"], "lens_saved");
         assert_eq!(ev["name"], "mine");
         assert_eq!(ev["visible_statuses"][1], "blocked");
         assert_eq!(ev["query"], "eda");
+        assert_eq!(ev["positions"][0]["id"], "id-a");
+        assert_eq!(ev["positions"][0]["x"], 1.0);
         let ev = lens_deleted_event("mine");
         assert_eq!(ev["kind"], "lens_deleted");
     }
@@ -425,8 +471,8 @@ mod tests {
     #[test]
     fn lenses_round_trip_through_the_log() {
         let dir = tempfile::tempdir().unwrap();
-        append_event(dir.path(), &lens_saved_event("a", &["started"], "")).unwrap();
-        append_event(dir.path(), &lens_saved_event("b", &["blocked"], "q")).unwrap();
+        append_event(dir.path(), &lens_saved_event("a", &["started"], "", &[])).unwrap();
+        append_event(dir.path(), &lens_saved_event("b", &["blocked"], "q", &[])).unwrap();
         append_event(dir.path(), &lens_deleted_event("a")).unwrap();
         let lenses = load_lenses(dir.path()).unwrap();
         assert_eq!(lenses.len(), 1);

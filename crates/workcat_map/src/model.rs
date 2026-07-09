@@ -190,6 +190,10 @@ pub struct Lens {
     pub name: String,
     pub visible_statuses: Vec<String>,
     pub query: String,
+    /// Node positions captured when the lens was saved: `(id, x, y)`.
+    /// A lens organizes a workstream by geometry as well as by filter,
+    /// so applying it restores these positions (the SPA behavior).
+    pub positions: Vec<(String, f32, f32)>,
 }
 
 impl Lens {
@@ -237,12 +241,28 @@ pub fn fold_lenses<'a>(lines: impl Iterator<Item = &'a str>) -> BTreeMap<String,
                     .and_then(|v| v.as_str())
                     .unwrap_or_default()
                     .to_string();
+                let positions = value
+                    .get("positions")
+                    .and_then(|v| v.as_array())
+                    .map(|entries| {
+                        entries
+                            .iter()
+                            .filter_map(|entry| {
+                                let id = entry.get("id")?.as_str()?.to_string();
+                                let x = entry.get("x")?.as_f64()? as f32;
+                                let y = entry.get("y")?.as_f64()? as f32;
+                                Some((id, x, y))
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
                 lenses.insert(
                     name.to_string(),
                     Lens {
                         name: name.to_string(),
                         visible_statuses,
                         query,
+                        positions,
                     },
                 );
             }
@@ -432,9 +452,99 @@ pub fn fold_node_positions<'a>(
     positions
 }
 
+/// Merge append-only event logs without a `git stash pop`. `committed`
+/// is kept verbatim (its order, including the identical-timestamp epoch
+/// block, is preserved); then every line present in `working` or
+/// `stash` but not already committed is appended, de-duplicated and
+/// sorted by its `ts` field. Ordering by `ts` makes the fold's
+/// log-order last-write-wins correct even when a status change and its
+/// successor were split across the working tree and the stash.
+///
+/// This replaces the checkpoint's `git stash pop`, which conflicts (and
+/// strands events) whenever a concurrent append lands on the log during
+/// the checkpoint window.
+pub fn merge_append_log(committed: &str, working: &str, stash: &str) -> String {
+    let committed_lines: Vec<&str> = committed
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .collect();
+    let committed_set: HashSet<&str> = committed_lines.iter().copied().collect();
+    let mut seen: HashSet<&str> = HashSet::new();
+    let mut appends: Vec<&str> = Vec::new();
+    for line in working.lines().chain(stash.lines()) {
+        if line.trim().is_empty() || committed_set.contains(line) || !seen.insert(line) {
+            continue;
+        }
+        appends.push(line);
+    }
+    appends.sort_by_key(|line| ts_key(line));
+    let mut out = String::new();
+    for line in committed_lines.iter().chain(appends.iter()) {
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
+}
+
+/// The `ts` field of an event line, for ordering merged appends. Lines
+/// that don't parse or lack a `ts` sort first (empty key), which only
+/// affects malformed lines.
+fn ts_key(line: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(line)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("ts")
+                .and_then(|ts| ts.as_str())
+                .map(str::to_string)
+        })
+        .unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn merge_append_log_unions_and_ts_orders_without_conflict() {
+        // committed has the epoch block (identical ts, must keep order)
+        // plus one real event.
+        let committed = concat!(
+            r#"{"ts":"2026-07-07T16:53:00.5+00:00","actor":"m","kind":"item_snapshot","id":"a"}"#,
+            "\n",
+            r#"{"ts":"2026-07-07T16:53:00.5+00:00","actor":"m","kind":"item_snapshot","id":"b"}"#,
+            "\n",
+            r#"{"ts":"2026-07-08T01:00:00+00:00","kind":"status_set","id":"x","status":"started"}"#,
+            "\n",
+        );
+        // The working tree gained a concurrent append (the successor)
+        // during the checkpoint window...
+        let working = concat!(
+            r#"{"ts":"2026-07-08T01:00:00+00:00","kind":"status_set","id":"x","status":"started"}"#,
+            "\n",
+            r#"{"ts":"2026-07-08T02:00:02+00:00","kind":"status_set","id":"x","status":"implemented"}"#,
+            "\n",
+        );
+        // ...while the stash holds the earlier pending event (its
+        // predecessor), out of order relative to the working append.
+        let stash = concat!(
+            r#"{"ts":"2026-07-08T01:00:00+00:00","kind":"status_set","id":"x","status":"started"}"#,
+            "\n",
+            r#"{"ts":"2026-07-08T02:00:01+00:00","kind":"status_set","id":"x","status":"unknown"}"#,
+            "\n",
+        );
+        let merged = merge_append_log(committed, working, stash);
+        let lines: Vec<&str> = merged.lines().collect();
+        // Epoch block order preserved; committed real event kept once.
+        assert!(lines[0].contains(r#""id":"a""#));
+        assert!(lines[1].contains(r#""id":"b""#));
+        assert_eq!(lines.len(), 5, "3 committed + 2 unique appends");
+        // The two new appends are ts-ordered: unknown (02:00:01) before
+        // implemented (02:00:02), so the fold's last-write is implemented.
+        let unknown = lines.iter().position(|l| l.contains("unknown")).unwrap();
+        let implemented = lines.iter().position(|l| l.contains("implemented")).unwrap();
+        assert!(unknown < implemented);
+    }
     use pretty_assertions::assert_eq;
 
     const BRIEF: &str = "\
