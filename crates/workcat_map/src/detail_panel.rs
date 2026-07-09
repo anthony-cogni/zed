@@ -340,6 +340,12 @@ impl WorkcatDetailView {
             cx.notify();
             return;
         };
+        // A ref may carry a `#anchor` suffix (a markdown heading
+        // reference, e.g. `HANDOFF.md#7`); strip it for file resolution
+        // (opening at that specific anchor isn't supported yet — the
+        // file just opens at the top) while keeping the full reference
+        // for display.
+        let file_part = reference.split('#').next().unwrap_or(&reference);
         // Most handoff refs live outside whatever project this map's
         // own workspace happens to have open, so check the open
         // worktrees first, then fall back to the conventional handoff
@@ -349,10 +355,10 @@ impl WorkcatDetailView {
             .project()
             .read(cx)
             .visible_worktrees(cx)
-            .map(|worktree| worktree.read(cx).abs_path().join(&reference))
+            .map(|worktree| worktree.read(cx).abs_path().join(file_part))
             .find(|path| path.is_file());
         let existing = in_project.or_else(|| {
-            let candidate = crate::store::resolve_handoff_root().join(&reference);
+            let candidate = crate::store::resolve_handoff_root().join(file_part);
             candidate.is_file().then_some(candidate)
         });
         match existing {
