@@ -20,21 +20,15 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::rc::Rc;
 use std::time::Duration;
 
-use anyhow::Result;
 use editor::{Editor, EditorEvent};
 use futures::StreamExt as _;
 use gpui::{
-    App, AsyncWindowContext, Context, DismissEvent, DispatchPhase, Entity, EventEmitter,
-    FocusHandle, Focusable, Hsla, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    PathBuilder, PinchEvent, Pixels, Point, ScrollHandle, SharedString, Subscription, Task,
-    WeakEntity, Window,
-    actions, anchored, canvas, deferred, point, px,
+    App, Context, DismissEvent, DispatchPhase, Entity, FocusHandle, Focusable, Hsla, MouseButton,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathBuilder, PinchEvent, Pixels, Point,
+    ScrollHandle, SharedString, Subscription, Task, WeakEntity, Window, actions, anchored, canvas,
+    deferred, point, px,
 };
 use ui::{ContextMenu, prelude::*};
-use workspace::{
-    Workspace,
-    dock::{DockPosition, Panel, PanelEvent},
-};
 
 use crate::geometry;
 use crate::model::{ALL_STATUSES, FilterState, ItemMeta, Lens, Op, Status, UndoStack};
@@ -117,8 +111,6 @@ pub struct WorkcatMapHandle(pub Option<WeakEntity<WorkcatMapView>>);
 
 impl gpui::Global for WorkcatMapHandle {}
 
-const WORKCAT_MAP_PANEL_KEY: &str = "WorkcatMapPanel";
-const DEFAULT_WIDTH: f32 = 640.;
 /// ~16 words: four wrapped lines of ~30 characters.
 const MAX_LABEL_CHARS: usize = 118;
 /// How long the map waits after the last mutation before auto-checkpointing.
@@ -127,14 +119,10 @@ const AUTO_CHECKPOINT_DELAY: Duration = Duration::from_secs(5);
 /// saved arrangement is the startup view.
 const DEFAULT_LENS: &str = "default";
 
-pub fn init(cx: &mut App) {
-    cx.observe_new(|workspace: &mut Workspace, _, _| {
-        workspace.register_action(|workspace, _: &ToggleFocus, window, cx| {
-            workspace.toggle_panel_focus::<WorkcatMapPanel>(window, cx);
-        });
-    })
-    .detach();
-}
+/// The dock panel wrapper (and its `ToggleFocus`/`ToggleDetailPanelFocus`
+/// registrations) lives in `workcat_panel.rs`, which combines this view
+/// with `WorkcatDetailView` into one panel.
+pub fn init(_cx: &mut App) {}
 
 /// One rendered node: an index into `items` plus owned geometry.
 struct MapNode {
@@ -2039,94 +2027,5 @@ impl Render for WorkcatMapView {
     }
 }
 
-/// The dock panel wrapper.
-pub struct WorkcatMapPanel {
-    view: Entity<WorkcatMapView>,
-    position: DockPosition,
-}
-
-impl WorkcatMapPanel {
-    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let view = cx.new(|cx| WorkcatMapView::new(window, cx));
-        Self {
-            view,
-            position: DockPosition::Right,
-        }
-    }
-
-    pub async fn load(
-        workspace: WeakEntity<Workspace>,
-        mut cx: AsyncWindowContext,
-    ) -> Result<Entity<Self>> {
-        workspace.update_in(&mut cx, |_workspace, window, cx| {
-            cx.new(|cx| Self::new(window, cx))
-        })
-    }
-}
-
-impl EventEmitter<PanelEvent> for WorkcatMapPanel {}
-
-impl Focusable for WorkcatMapPanel {
-    fn focus_handle(&self, cx: &App) -> FocusHandle {
-        self.view.focus_handle(cx)
-    }
-}
-
-impl Render for WorkcatMapPanel {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        div().size_full().child(self.view.clone())
-    }
-}
-
-impl Panel for WorkcatMapPanel {
-    fn persistent_name() -> &'static str {
-        "WorkcatMapPanel"
-    }
-
-    fn panel_key() -> &'static str {
-        WORKCAT_MAP_PANEL_KEY
-    }
-
-    fn position(&self, _window: &Window, _cx: &App) -> DockPosition {
-        self.position
-    }
-
-    fn position_is_valid(&self, position: DockPosition) -> bool {
-        matches!(position, DockPosition::Left | DockPosition::Right)
-    }
-
-    fn set_position(
-        &mut self,
-        position: DockPosition,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.position = position;
-        cx.notify();
-    }
-
-    fn default_size(&self, _window: &Window, _cx: &App) -> Pixels {
-        px(DEFAULT_WIDTH)
-    }
-
-    fn starts_open(&self, _window: &Window, _cx: &App) -> bool {
-        // Default layout shows the map and the detail pane together.
-        true
-    }
-
-    fn icon(&self, _window: &Window, _cx: &App) -> Option<IconName> {
-        Some(IconName::Blocks)
-    }
-
-    fn icon_tooltip(&self, _window: &Window, _cx: &App) -> Option<&'static str> {
-        Some("Workcat Map")
-    }
-
-    fn toggle_action(&self) -> Box<dyn gpui::Action> {
-        Box::new(ToggleFocus)
-    }
-
-    fn activation_priority(&self) -> u32 {
-        11
-    }
-}
+// The dock panel wrapper combining this view with WorkcatDetailView
+// lives in workcat_panel.rs.

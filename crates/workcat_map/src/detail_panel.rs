@@ -18,18 +18,14 @@
 
 use std::time::Duration;
 
-use anyhow::Result;
 use editor::{Editor, EditorEvent};
 use gpui::{
-    AnyElement, App, AsyncWindowContext, ClickEvent, Context, DismissEvent, Div, Entity,
-    EventEmitter, FocusHandle, Focusable, Hsla, Pixels, Point, SharedString, Subscription, Task,
-    WeakEntity, Window, actions, anchored, deferred, px,
+    AnyElement, App, ClickEvent, Context, DismissEvent, Div, Entity, FocusHandle, Focusable, Hsla,
+    Pixels, Point, SharedString, Subscription, Task, WeakEntity, Window, actions, anchored,
+    deferred, px,
 };
 use ui::{ContextMenu, Tooltip, prelude::*};
-use workspace::{
-    OpenOptions, OpenVisible, Workspace,
-    dock::{DockPosition, Panel, PanelEvent},
-};
+use workspace::{OpenOptions, OpenVisible, Workspace};
 
 use crate::model::{ItemMeta, Status};
 use crate::panel::{WorkcatMapHandle, WorkcatMapView, ZoomIn, ZoomOut, ZoomReset};
@@ -42,24 +38,28 @@ actions!(
     ]
 );
 
-const WORKCAT_DETAIL_PANEL_KEY: &str = "WorkcatDetailPanel";
-/// Minimum default width (px) for the reading pane on narrow windows.
-const DEFAULT_WIDTH: f32 = 420.;
-/// Fraction of the window width the reading pane defaults to (~1/5-1/4).
-const DETAIL_WIDTH_FRACTION: f32 = 0.22;
+/// Requests opening a work item's originating Zed conversation (its
+/// `ref`, when that ref is a bare conversation id rather than a file
+/// path) in the real agent panel. The workcat_map crate has no
+/// dependency on agent internals, so this is just a signal; `zed.rs`
+/// (which already depends on both crates) registers the handler that
+/// resolves the id to an `acp::SessionId` and calls
+/// `AgentPanel::open_thread`.
+#[derive(Clone, PartialEq, serde::Deserialize, schemars::JsonSchema, gpui::Action)]
+#[action(namespace = workcat_map)]
+pub struct OpenConversation {
+    pub thread_id: String,
+}
+
 /// Debounce before an edit to the Notes field autosaves.
 const AUTOSAVE_DELAY: Duration = Duration::from_millis(700);
 /// How long the "Marked as canceled" undo affordance stays offered.
 const CANCEL_UNDO_WINDOW: Duration = Duration::from_secs(6);
 
-pub fn init(cx: &mut App) {
-    cx.observe_new(|workspace: &mut Workspace, _, _| {
-        workspace.register_action(|workspace, _: &ToggleDetailPanelFocus, window, cx| {
-            workspace.toggle_panel_focus::<WorkcatDetailPanel>(window, cx);
-        });
-    })
-    .detach();
-}
+/// The dock panel wrapper (and its `ToggleDetailPanelFocus`
+/// registration) lives in `workcat_panel.rs`, which combines this view
+/// with `WorkcatMapView` into one panel.
+pub fn init(_cx: &mut App) {}
 
 /// The detail view: renders whatever the map has focused.
 pub struct WorkcatDetailView {
@@ -318,16 +318,20 @@ impl WorkcatDetailView {
     /// Open the focused item's `ref`. Most refs are a file path (a
     /// handoff doc) resolved against the visible worktrees and opened in
     /// the editor; the rest are a Zed conversation id (a bare uuid),
-    /// which has no file, so we copy it for now (a dedicated conversation
-    /// viewer panel is a follow-up).
+    /// opened in the real agent panel (see `OpenConversation`).
     fn open_reference(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(item) = self.focused_item(cx) else {
             return;
         };
         let reference = item.reference;
         if is_conversation_ref(&reference) {
-            cx.write_to_clipboard(gpui::ClipboardItem::new_string(reference.clone()));
-            self.status = format!("conversation id copied: {}", short_id(&reference)).into();
+            window.dispatch_action(
+                Box::new(OpenConversation {
+                    thread_id: reference.clone(),
+                }),
+                cx,
+            );
+            self.status = format!("opening conversation {}", short_id(&reference)).into();
             cx.notify();
             return;
         }
@@ -742,107 +746,5 @@ impl Render for WorkcatDetailView {
     }
 }
 
-/// The dock panel wrapper.
-pub struct WorkcatDetailPanel {
-    view: Entity<WorkcatDetailView>,
-    position: DockPosition,
-}
-
-impl WorkcatDetailPanel {
-    pub fn new(
-        workspace: WeakEntity<Workspace>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Self {
-        let view = cx.new(|cx| WorkcatDetailView::new(workspace, window, cx));
-        Self {
-            view,
-            // The map lives in the right dock; defaulting detail to
-            // the left lets both panels be open at once (one active
-            // panel per dock).
-            position: DockPosition::Left,
-        }
-    }
-
-    pub async fn load(
-        workspace: WeakEntity<Workspace>,
-        mut cx: AsyncWindowContext,
-    ) -> Result<Entity<Self>> {
-        let handle = workspace.clone();
-        handle.update_in(&mut cx, move |_workspace, window, cx| {
-            cx.new(|cx| Self::new(workspace.clone(), window, cx))
-        })
-    }
-}
-
-impl EventEmitter<PanelEvent> for WorkcatDetailPanel {}
-
-impl Focusable for WorkcatDetailPanel {
-    fn focus_handle(&self, cx: &App) -> FocusHandle {
-        self.view.focus_handle(cx)
-    }
-}
-
-impl Render for WorkcatDetailPanel {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        div().size_full().child(self.view.clone())
-    }
-}
-
-impl Panel for WorkcatDetailPanel {
-    fn persistent_name() -> &'static str {
-        "WorkcatDetailPanel"
-    }
-
-    fn panel_key() -> &'static str {
-        WORKCAT_DETAIL_PANEL_KEY
-    }
-
-    fn position(&self, _window: &Window, _cx: &App) -> DockPosition {
-        self.position
-    }
-
-    fn position_is_valid(&self, position: DockPosition) -> bool {
-        matches!(position, DockPosition::Left | DockPosition::Right)
-    }
-
-    fn set_position(
-        &mut self,
-        position: DockPosition,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.position = position;
-        cx.notify();
-    }
-
-    fn default_size(&self, window: &Window, _cx: &App) -> Pixels {
-        // Default the reading pane to ~22% of the window width (between
-        // 1/5 and 1/4), with a floor so it stays usable on narrow
-        // windows. A previously dragged size is restored from serialized
-        // state and takes precedence over this default.
-        let viewport_width = window.viewport_size().width;
-        (viewport_width * DETAIL_WIDTH_FRACTION).max(px(DEFAULT_WIDTH))
-    }
-
-    fn starts_open(&self, _window: &Window, _cx: &App) -> bool {
-        // Default layout shows the map and the detail pane together.
-        true
-    }
-
-    fn icon(&self, _window: &Window, _cx: &App) -> Option<IconName> {
-        Some(IconName::Reader)
-    }
-
-    fn icon_tooltip(&self, _window: &Window, _cx: &App) -> Option<&'static str> {
-        Some("Workcat Detail")
-    }
-
-    fn toggle_action(&self) -> Box<dyn gpui::Action> {
-        Box::new(ToggleDetailPanelFocus)
-    }
-
-    fn activation_priority(&self) -> u32 {
-        12
-    }
-}
+// The dock panel wrapper combining this view with WorkcatMapView lives
+// in workcat_panel.rs.

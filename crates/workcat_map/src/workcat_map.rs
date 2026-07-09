@@ -21,15 +21,17 @@ pub mod geometry;
 pub mod model;
 mod panel;
 pub mod store;
+mod workcat_panel;
 
-pub use detail_panel::{ToggleDetailPanelFocus, WorkcatDetailPanel, WorkcatDetailView};
+pub use detail_panel::{OpenConversation, ToggleDetailPanelFocus, WorkcatDetailView};
 pub use panel::{
-    Checkpoint, ClearFocus, SetStatus, ToggleFocus, WorkcatMapHandle, WorkcatMapPanel,
-    WorkcatMapView,
+    Checkpoint, ClearFocus, SetStatus, ToggleFocus, WorkcatMapHandle, WorkcatMapView,
 };
+pub use workcat_panel::WorkcatPanel;
 
-/// Registers both panels' workspace actions.
+/// Registers the combined panel's workspace actions.
 pub fn init(cx: &mut gpui::App) {
     panel::init(cx);
     detail_panel::init(cx);
+    workcat_panel::init(cx);
 }
