@@ -1517,18 +1517,23 @@ impl WorkcatMapView {
         for item in &self.items {
             *counts.entry(item.status).or_default() += 1;
         }
+        // A single fixed-height row: many status chips no longer fit one
+        // line at every panel width, so this scrolls horizontally rather
+        // than wrapping (wrapping made the whole top bar grow tall).
         let mut row = h_flex()
+            .id("workcat-filter-row")
             .w_full()
             .px_2()
             .py_1p5()
             .gap_2()
-            .flex_wrap()
+            .flex_none()
+            .overflow_x_scroll()
             .border_b_1()
             .border_color(colors.border)
             .child(
                 div()
-                    .min_w(px(160.))
-                    .flex_grow(1.)
+                    .flex_none()
+                    .w(px(200.))
                     .px_1p5()
                     .py_0p5()
                     .rounded_md()

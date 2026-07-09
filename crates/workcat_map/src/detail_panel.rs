@@ -340,13 +340,21 @@ impl WorkcatDetailView {
             cx.notify();
             return;
         };
-        let existing = workspace
+        // Most handoff refs live outside whatever project this map's
+        // own workspace happens to have open, so check the open
+        // worktrees first, then fall back to the conventional handoff
+        // root (agent_notes/... is rooted there, not in any one project).
+        let in_project = workspace
             .read(cx)
             .project()
             .read(cx)
             .visible_worktrees(cx)
             .map(|worktree| worktree.read(cx).abs_path().join(&reference))
             .find(|path| path.is_file());
+        let existing = in_project.or_else(|| {
+            let candidate = crate::store::resolve_handoff_root().join(&reference);
+            candidate.is_file().then_some(candidate)
+        });
         match existing {
             Some(path) => {
                 let task = workspace.update(cx, |workspace, cx| {
@@ -364,7 +372,7 @@ impl WorkcatDetailView {
                 self.status = format!("opening {reference}").into();
             }
             None => {
-                self.status = format!("handoff not in project: {reference}").into();
+                self.status = format!("handoff not found: {reference}").into();
             }
         }
         cx.notify();

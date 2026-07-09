@@ -42,6 +42,22 @@ pub fn resolve_db_dir() -> PathBuf {
         .unwrap_or_else(default_db_dir)
 }
 
+/// Overrides the extra root the detail panel searches for a path-shaped
+/// `ref` (a handoff doc) when it isn't under any of the currently open
+/// project's worktrees.
+pub const HANDOFF_ROOT_ENV_VAR: &str = "WORKCAT_HANDOFF_ROOT";
+
+/// A workcat item's handoff doc (`agent_notes/...`) is conventionally
+/// rooted in this directory, which is very often not the project the
+/// map's own workspace has open. Checked only as a fallback, after the
+/// open worktrees.
+pub fn resolve_handoff_root() -> PathBuf {
+    std::env::var(HANDOFF_ROOT_ENV_VAR)
+        .ok()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| paths::home_dir().join("eng-tools-anthony"))
+}
+
 /// Load every item's metadata from the materialized briefs.
 pub fn load_items(db: &Path) -> Result<Vec<ItemMeta>> {
     let briefs = db.join("briefs");
