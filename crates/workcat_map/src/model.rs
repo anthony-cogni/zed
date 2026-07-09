@@ -91,27 +91,6 @@ impl Status {
         ALL_STATUSES.iter().position(|s| *s == self).unwrap_or(0)
     }
 
-    /// The single most-likely forward transition, shown on the detail
-    /// panel's primary "next action" button (its verb) and applied on
-    /// click. `None` means the status is a resting end state with no
-    /// obvious next step (`Complete`) — the button is hidden. A `Some`
-    /// with a `None` target is a prompt-only action (`Unknown`
-    /// -> triage): the verb shows, but clicking opens the full status
-    /// menu instead of transitioning.
-    pub fn next_transition(self) -> Option<(&'static str, Option<Status>)> {
-        Some(match self {
-            Self::NotStarted => ("Start", Some(Self::Started)),
-            Self::Started => ("Mark implemented", Some(Self::Implemented)),
-            Self::Paused => ("Resume", Some(Self::Started)),
-            Self::Blocked => ("Unblock", Some(Self::Started)),
-            Self::Implemented => ("Mark merged", Some(Self::Merged)),
-            Self::Merged => ("Mark complete", Some(Self::Complete)),
-            Self::Complete => return None,
-            Self::Canceled => ("Reopen", Some(Self::NotStarted)),
-            Self::Unknown => ("Triage\u{2026}", None),
-        })
-    }
-
     /// Whether this status is an off-lifecycle terminal choice
     /// (`Canceled`, `Unknown`). The status menu draws these below a
     /// divider, separating them from the ordinary forward flow.
@@ -129,6 +108,9 @@ pub struct ItemMeta {
     /// The item's `ref` field (identity key).
     pub reference: String,
     pub status: Status,
+    /// The `updated_at` metadata field verbatim (ISO-ish), if present.
+    /// The detail panel humanizes it for the footer.
+    pub updated_at: Option<String>,
     /// Dependencies as id8 prefixes (first 8 hex digits of the dep uuid).
     pub depends_on: Vec<String>,
     /// Brief body sections in file order: (heading, body text).
@@ -349,6 +331,7 @@ pub fn parse_brief(text: &str) -> Option<ItemMeta> {
     let mut id = None;
     let mut reference = None;
     let mut status = None;
+    let mut updated_at = None;
     let mut depends_on = Vec::new();
     let mut in_depends = false;
     let mut in_sections = false;
@@ -391,6 +374,8 @@ pub fn parse_brief(text: &str) -> Option<ItemMeta> {
             reference = Some(value.trim().to_string());
         } else if let Some(value) = rest.strip_prefix("status: ") {
             status = Status::parse(value.trim());
+        } else if let Some(value) = rest.strip_prefix("updated_at: ") {
+            updated_at = Some(value.trim().to_string());
         } else if rest.trim_end() == "depends_on:" {
             in_depends = true;
         }
@@ -404,6 +389,7 @@ pub fn parse_brief(text: &str) -> Option<ItemMeta> {
         subject: subject?,
         reference: reference?,
         status: status?,
+        updated_at,
         depends_on,
         sections,
     })
@@ -481,6 +467,7 @@ Not started.
                 subject: "Bootstrap the workcat repo-as-database substrate (epoch zero)".into(),
                 reference: "agent_notes/2026-07-06/workcat-substrate-bootstrap-HANDOFF.md".into(),
                 status: Status::NotStarted,
+                updated_at: Some("2026-07-07T16:53:00.562099+00:00".into()),
                 depends_on: vec!["e89113a0".into()],
                 sections: vec![
                     ("State".into(), "Not started.".into()),
@@ -539,30 +526,6 @@ Not started.
     }
 
     #[test]
-    fn next_transition_follows_the_lifecycle() {
-        assert_eq!(
-            Status::NotStarted.next_transition(),
-            Some(("Start", Some(Status::Started)))
-        );
-        assert_eq!(
-            Status::Started.next_transition(),
-            Some(("Mark implemented", Some(Status::Implemented)))
-        );
-        assert_eq!(
-            Status::Merged.next_transition(),
-            Some(("Mark complete", Some(Status::Complete)))
-        );
-        // Complete is a resting end state: no primary action.
-        assert_eq!(Status::Complete.next_transition(), None);
-        // Canceled reopens; Unknown is prompt-only (opens the menu).
-        assert_eq!(
-            Status::Canceled.next_transition(),
-            Some(("Reopen", Some(Status::NotStarted)))
-        );
-        assert_eq!(Status::Unknown.next_transition(), Some(("Triage\u{2026}", None)));
-    }
-
-    #[test]
     fn only_canceled_and_unknown_are_terminal_choices() {
         for status in ALL_STATUSES {
             assert_eq!(
@@ -599,6 +562,7 @@ Not started.
             subject: subject.into(),
             reference: reference.into(),
             status,
+            updated_at: None,
             depends_on: Vec::new(),
             sections: Vec::new(),
         }

@@ -1,16 +1,21 @@
-//! The Workcat Detail dock panel: the reading-and-acting surface for
-//! the map's focused item. It renders the brief as the mockup's layout
-//! — title, a clickable status pill, a primary "next action" split
-//! button, the Next callout, a Context handoff chip, Hazards, and an
-//! autosaving Notes field — plus a footer with the dependency count.
+//! The Workcat Detail dock panel: the single-status-control reading
+//! surface for the map's focused item. It renders the brief as the
+//! design mockup: title, a status pill that is the *only* status
+//! control (it opens the shared "Set status" menu), Open handoff /
+//! Locate actions, one handoff context chip, an editable Hazards list
+//! (with the Blocked-on flow), and an autosaving Notes field, over a
+//! footer with the dependency count and last-updated time.
 //!
 //! The map panel stays the gesture surface; this panel is where a brief
 //! is read and its status is advanced. They communicate through a
 //! `WorkcatMapHandle` global: the map view registers itself there, and
 //! this panel observes the map entity, re-rendering on every
-//! focus/mutation notify. Status changes and notes writes flow back
-//! through the map view, keeping the event-append path and the
-//! pending-events counter in one place.
+//! focus/mutation notify. Status changes, notes, and hazards all flow
+//! back through the map view, keeping the event-append path and the
+//! pending-events counter in one place. Status *side effects* (the
+//! Blocked prompt, the Canceled undo, the Unknown triage note) are
+//! driven off the observed status transition, so they fire no matter
+//! which surface changed the status.
 
 use std::time::Duration;
 
@@ -21,14 +26,14 @@ use gpui::{
     EventEmitter, FocusHandle, Focusable, Hsla, Pixels, Point, SharedString, Subscription, Task,
     WeakEntity, Window, actions, anchored, deferred, px,
 };
-use ui::{ContextMenu, IconButton, IconPosition, Tooltip, prelude::*};
+use ui::{ContextMenu, Tooltip, prelude::*};
 use workspace::{
     OpenOptions, OpenVisible, Workspace,
     dock::{DockPosition, Panel, PanelEvent},
 };
 
-use crate::model::{ALL_STATUSES, ItemMeta, Status};
-use crate::panel::{SetStatus, WorkcatMapHandle, WorkcatMapView, ZoomIn, ZoomOut, ZoomReset};
+use crate::model::{ItemMeta, Status};
+use crate::panel::{WorkcatMapHandle, WorkcatMapView, ZoomIn, ZoomOut, ZoomReset};
 
 actions!(
     workcat_map,
@@ -45,6 +50,10 @@ const DEFAULT_WIDTH: f32 = 420.;
 const DETAIL_WIDTH_FRACTION: f32 = 0.22;
 /// Debounce before an edit to the Notes field autosaves.
 const AUTOSAVE_DELAY: Duration = Duration::from_millis(700);
+/// How long the "Marked as canceled" undo affordance stays offered.
+const CANCEL_UNDO_WINDOW: Duration = Duration::from_secs(6);
+/// Prefix marking a hazard as a Blocked-on record (cleared on unblock).
+const BLOCKED_ON_PREFIX: &str = "Blocked on:";
 
 pub fn init(cx: &mut App) {
     cx.observe_new(|workspace: &mut Workspace, _, _| {
@@ -68,7 +77,17 @@ pub struct WorkcatDetailView {
     /// notes text, so the resulting edit event does not autosave.
     suppress_autosave: bool,
     autosave_task: Option<Task<()>>,
-    /// The status/autosave line under the Notes field.
+    /// The item id / status the panel last reconciled to, so a status
+    /// transition (from any surface) can trigger its side effects once.
+    tracked_item: Option<String>,
+    tracked_status: Option<Status>,
+    /// The Blocked-on reason input, shown after a change to Blocked.
+    blocked_editor: Entity<Editor>,
+    blocked_prompt: bool,
+    /// The status to restore while the Canceled undo window is open.
+    undo_prev: Option<Status>,
+    undo_task: Option<Task<()>>,
+    /// The status/autosave/notice line under the Notes field.
     status: SharedString,
     /// The open "Set status" popover (menu, anchor, dismiss sub).
     status_menu: Option<(Entity<ContextMenu>, Point<Pixels>, Subscription)>,
@@ -87,6 +106,15 @@ impl WorkcatDetailView {
         let notes_editor = cx.new(|cx| {
             let mut editor = Editor::auto_height(1, 8, window, cx);
             editor.set_placeholder_text("Add a note\u{2026}", window, cx);
+            editor
+        });
+        let blocked_editor = cx.new(|cx| {
+            let mut editor = Editor::single_line(window, cx);
+            editor.set_placeholder_text(
+                "Blocked on\u{2026} (work item, thread, or person)",
+                window,
+                cx,
+            );
             editor
         });
         // The map panel may register its handle before or after this
@@ -132,6 +160,12 @@ impl WorkcatDetailView {
             notes_item: None,
             suppress_autosave: false,
             autosave_task: None,
+            tracked_item: None,
+            tracked_status: None,
+            blocked_editor,
+            blocked_prompt: false,
+            undo_prev: None,
+            undo_task: None,
             status: SharedString::default(),
             status_menu: None,
             zoom: 1.0,
@@ -163,9 +197,12 @@ impl WorkcatDetailView {
         self.map = Some(map.downgrade());
     }
 
+    fn map(&self) -> Option<Entity<WorkcatMapView>> {
+        self.map.as_ref().and_then(|weak| weak.upgrade())
+    }
+
     fn focused_item(&self, cx: &App) -> Option<ItemMeta> {
-        let map = self.map.as_ref()?.upgrade()?;
-        map.read(cx).focused_item().cloned()
+        self.map()?.read(cx).focused_item().cloned()
     }
 
     /// Keep the notes editor's text in step with the focused item.
@@ -192,6 +229,39 @@ impl WorkcatDetailView {
         self.status = SharedString::default();
     }
 
+    /// Reconcile transient UI to the focused item, and fire the side
+    /// effects of a status transition once (Blocked prompt, Canceled
+    /// undo, Unknown triage note, unblock clears Blocked-on hazards).
+    fn sync_focused(&mut self, item: Option<&ItemMeta>, cx: &mut Context<Self>) {
+        let new_id = item.map(|item| item.id.as_str());
+        if self.tracked_item.as_deref() != new_id {
+            self.tracked_item = new_id.map(str::to_string);
+            self.tracked_status = item.map(|item| item.status);
+            self.blocked_prompt = false;
+            self.undo_prev = None;
+            self.status = SharedString::default();
+            return;
+        }
+        let new_status = item.map(|item| item.status);
+        if self.tracked_status == new_status {
+            return;
+        }
+        let prev = self.tracked_status;
+        self.tracked_status = new_status;
+        if prev == Some(Status::Blocked) && new_status != Some(Status::Blocked) {
+            self.blocked_prompt = false;
+            if let Some(item) = item {
+                self.clear_blocked_hazards(item, cx);
+            }
+        }
+        match new_status {
+            Some(Status::Blocked) => self.blocked_prompt = true,
+            Some(Status::Canceled) => self.show_undo_banner(prev, cx),
+            Some(Status::Unknown) => self.status = "Flagged for triage".into(),
+            _ => {}
+        }
+    }
+
     const MIN_ZOOM: f32 = 0.7;
     const MAX_ZOOM: f32 = 2.0;
 
@@ -214,54 +284,18 @@ impl WorkcatDetailView {
         let Some(id) = self.notes_item.clone() else {
             return;
         };
-        let Some(map) = self.map.as_ref().and_then(|weak| weak.upgrade()) else {
+        let Some(map) = self.map() else {
             self.status = "map panel not loaded".into();
             cx.notify();
             return;
         };
         let text = self.notes_editor.read(cx).text(cx).trim().to_string();
-        let message = map.update(cx, |map, cx| map.save_notes_for(&id, text, cx));
-        self.status = message.into();
+        map.update(cx, |map, cx| map.save_notes_for(&id, text, cx));
+        self.status = "\u{2713} Saved just now".into();
         cx.notify();
     }
 
-    // === Status transitions ===
-
-    /// Set the focused item's status through the map view (the detail
-    /// item is the map's focused item), reusing the map's append +
-    /// checkpoint path.
-    fn apply_status(&mut self, status: Status, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(map) = self.map.as_ref().and_then(|weak| weak.upgrade()) else {
-            self.status = "map panel not loaded".into();
-            cx.notify();
-            return;
-        };
-        map.update(cx, |map, cx| {
-            map.set_status(
-                &SetStatus {
-                    status: status.as_str().to_string(),
-                },
-                window,
-                cx,
-            );
-        });
-    }
-
-    /// The primary split button: apply the status's forward transition,
-    /// or (for prompt-only transitions like Unknown -> triage) open the
-    /// full status menu.
-    fn primary_action(&mut self, anchor: Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(item) = self.focused_item(cx) else {
-            return;
-        };
-        let Some((_, to)) = item.status.next_transition() else {
-            return;
-        };
-        match to {
-            Some(to) => self.apply_status(to, window, cx),
-            None => self.open_status_menu(anchor, window, cx),
-        }
-    }
+    // === Status menu (the sole status control) ===
 
     fn open_status_menu(
         &mut self,
@@ -269,40 +303,18 @@ impl WorkcatDetailView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let current = self.focused_item(cx).map(|item| item.status);
-        let map = self.map.clone();
-        let menu = ContextMenu::build(window, cx, move |mut menu, _window, _cx| {
-            menu = menu.header("Set status");
-            let mut divided = false;
-            for status in ALL_STATUSES {
-                if status.is_terminal_choice() && !divided {
-                    menu = menu.separator();
-                    divided = true;
-                }
-                let map = map.clone();
-                menu = menu.toggleable_entry(
-                    status.label(),
-                    current == Some(status),
-                    IconPosition::Start,
-                    Some(Box::new(SetStatus {
-                        status: status.as_str().to_string(),
-                    })),
-                    move |window, cx| {
-                        if let Some(map) = map.as_ref().and_then(|weak| weak.upgrade()) {
-                            map.update(cx, |map, cx| {
-                                map.set_status(
-                                    &SetStatus {
-                                        status: status.as_str().to_string(),
-                                    },
-                                    window,
-                                    cx,
-                                );
-                            });
-                        }
-                    },
-                );
-            }
-            menu
+        let Some(map) = self.map() else {
+            self.status = "map panel not loaded".into();
+            cx.notify();
+            return;
+        };
+        let current = map.read(cx).focused_item().map(|item| item.status);
+        // Dispatch in the map's key context so the 1-9 SetStatus
+        // bindings show as badges and fire while the menu is open.
+        let map_focus = map.read(cx).focus_handle(cx);
+        let map_weak = map.downgrade();
+        let menu = ContextMenu::build(window, cx, move |menu, _, _| {
+            WorkcatMapView::populate_status_menu(menu.context(map_focus), current, map_weak)
         });
         window.focus(&menu.focus_handle(cx), cx);
         let subscription =
@@ -323,10 +335,9 @@ impl WorkcatDetailView {
 
     /// Scroll the map to the focused node (it is already focused there).
     fn locate(&mut self, cx: &mut Context<Self>) {
-        let Some(map) = self.map.as_ref().and_then(|weak| weak.upgrade()) else {
-            return;
-        };
-        map.update(cx, |map, cx| map.center_on_focused(cx));
+        if let Some(map) = self.map() {
+            map.update(cx, |map, cx| map.center_on_focused(cx));
+        }
     }
 
     /// Open the focused item's `ref` (its handoff doc) in the editor,
@@ -372,15 +383,99 @@ impl WorkcatDetailView {
         cx.notify();
     }
 
+    // === Hazards (editable Hazards section) ===
+
+    /// Persist a new hazards list for `item`, replacing the whole
+    /// `## Hazards` section through the map (event-sourced, like notes).
+    fn save_hazards(&mut self, item_id: &str, hazards: Vec<String>, cx: &mut Context<Self>) {
+        if let Some(map) = self.map() {
+            let id = item_id.to_string();
+            map.update(cx, |map, cx| {
+                map.save_section_for(&id, "Hazards", hazards.join("\n"), cx)
+            });
+        }
+    }
+
+    fn remove_hazard(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(item) = self.focused_item(cx) else {
+            return;
+        };
+        let mut hazards = hazard_lines(&item);
+        if index >= hazards.len() {
+            return;
+        }
+        hazards.remove(index);
+        self.save_hazards(&item.id, hazards, cx);
+    }
+
+    /// Drop any `Blocked on:` hazards; used when leaving Blocked.
+    fn clear_blocked_hazards(&mut self, item: &ItemMeta, cx: &mut Context<Self>) {
+        let hazards = hazard_lines(item);
+        let kept: Vec<String> = hazards
+            .iter()
+            .filter(|hazard| !hazard.starts_with(BLOCKED_ON_PREFIX))
+            .cloned()
+            .collect();
+        if kept.len() != hazards.len() {
+            let id = item.id.clone();
+            self.save_hazards(&id, kept, cx);
+        }
+    }
+
+    fn save_blocked_reason(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let reason = self.blocked_editor.read(cx).text(cx).trim().to_string();
+        self.blocked_prompt = false;
+        self.blocked_editor.update(cx, |editor, cx| {
+            editor.set_text("", window, cx);
+        });
+        if reason.is_empty() {
+            cx.notify();
+            return;
+        }
+        if let Some(item) = self.focused_item(cx) {
+            let mut hazards = hazard_lines(&item);
+            hazards.push(format!("{BLOCKED_ON_PREFIX} {reason}"));
+            self.save_hazards(&item.id, hazards, cx);
+        }
+        cx.notify();
+    }
+
+    // === Canceled undo ===
+
+    fn show_undo_banner(&mut self, prev: Option<Status>, cx: &mut Context<Self>) {
+        self.undo_prev = prev;
+        self.status = "Marked as canceled".into();
+        self.undo_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(CANCEL_UNDO_WINDOW).await;
+            this.update(cx, |this, cx| {
+                this.undo_prev = None;
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    fn undo_cancel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(prev) = self.undo_prev.take() else {
+            return;
+        };
+        self.undo_task = None;
+        if let Some(map) = self.map() {
+            map.update(cx, |map, cx| map.set_focused_status(prev, window, cx));
+        }
+        self.status = SharedString::default();
+        cx.notify();
+    }
+
     // === Rendering ===
 
     fn render_status_pill(
         &self,
         status: Status,
-        status_color: Hsla,
         zoom: f32,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
+        let status_color = WorkcatMapView::status_color(status);
         let muted = cx.theme().colors().text_muted;
         h_flex()
             .id("workcat-status-pill")
@@ -393,13 +488,14 @@ impl WorkcatDetailView {
             .border_color(status_color.alpha(0.5))
             .bg(status_color.alpha(0.15))
             .cursor_pointer()
+            .hover(|this| this.border_color(status_color.alpha(0.9)))
             .tooltip(Tooltip::text("Change status"))
             .child(div().flex_none().w_2().h_2().rounded_full().bg(status_color))
             .child(
                 div()
                     .font_weight(gpui::FontWeight::MEDIUM)
                     .text_size(px(12.5 * zoom))
-                    .child(SharedString::from(status.as_str())),
+                    .child(SharedString::from(status.label())),
             )
             .child(
                 div()
@@ -412,39 +508,25 @@ impl WorkcatDetailView {
             }))
     }
 
-    fn render_actions(&self, status: Status, cx: &mut Context<Self>) -> impl IntoElement {
-        let mut row = h_flex().mt_1().gap_2().flex_wrap();
-        if let Some((verb, _)) = status.next_transition() {
-            row = row
-                .child(
-                    Button::new("workcat-primary-action", verb)
-                        .style(ButtonStyle::Filled)
-                        .on_click(cx.listener(|this, event: &ClickEvent, window, cx| {
-                            this.primary_action(event.position(), window, cx);
-                        })),
-                )
-                .child(
-                    IconButton::new("workcat-status-more", IconName::ChevronDown)
-                        .tooltip(Tooltip::text("More status options"))
-                        .on_click(cx.listener(|this, event: &ClickEvent, window, cx| {
-                            this.open_status_menu(event.position(), window, cx);
-                        })),
-                );
-        }
-        row.child(
-            Button::new("workcat-open-handoff", "Open handoff").on_click(cx.listener(
-                |this, _: &ClickEvent, window, cx| {
-                    this.open_reference(window, cx);
-                },
-            )),
-        )
-        .child(
-            Button::new("workcat-locate", "Locate").on_click(cx.listener(
-                |this, _: &ClickEvent, _window, cx| {
-                    this.locate(cx);
-                },
-            )),
-        )
+    fn render_actions(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        h_flex()
+            .mt_1()
+            .gap_2()
+            .flex_wrap()
+            .child(
+                Button::new("workcat-open-handoff", "Open handoff")
+                    .style(ButtonStyle::Outlined)
+                    .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                        this.open_reference(window, cx);
+                    })),
+            )
+            .child(
+                Button::new("workcat-locate", "Locate")
+                    .style(ButtonStyle::Outlined)
+                    .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                        this.locate(cx);
+                    })),
+            )
     }
 
     fn render_context_chip(&self, reference: &str, cx: &mut Context<Self>) -> impl IntoElement {
@@ -461,6 +543,7 @@ impl WorkcatDetailView {
             .border_color(colors.border)
             .bg(colors.editor_background)
             .cursor_pointer()
+            .hover(|this| this.border_color(colors.border_focused))
             .tooltip(Tooltip::text(reference.to_string()))
             .child(div().child("\u{1f4c4}"))
             .child(
@@ -477,8 +560,92 @@ impl WorkcatDetailView {
             }))
     }
 
+    fn render_hazards(&self, item: &ItemMeta, zoom: f32, cx: &mut Context<Self>) -> impl IntoElement {
+        let muted = cx.theme().colors().text_muted;
+        let colors = cx.theme().colors().clone();
+        let hazard_color = WorkcatMapView::status_color(Status::Blocked);
+        let hazards = hazard_lines(item);
+        let mut section = v_flex().child(section_label("Hazards", muted, px(10.5 * zoom)));
+        if self.blocked_prompt {
+            section = section.child(
+                h_flex()
+                    .mt_1()
+                    .gap_2()
+                    .items_center()
+                    .child(
+                        div()
+                            .flex_1()
+                            .px_2()
+                            .py_1()
+                            .rounded_md()
+                            .border_1()
+                            .border_color(colors.border_variant)
+                            .bg(colors.editor_background)
+                            .child(self.blocked_editor.clone()),
+                    )
+                    .child(
+                        Button::new("workcat-blocked-save", "Save")
+                            .style(ButtonStyle::Outlined)
+                            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                                this.save_blocked_reason(window, cx);
+                            })),
+                    )
+                    .child(
+                        Button::new("workcat-blocked-skip", "Skip")
+                            .style(ButtonStyle::Outlined)
+                            .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                                this.blocked_prompt = false;
+                                cx.notify();
+                            })),
+                    ),
+            );
+        }
+        if hazards.is_empty() {
+            // Empty state is the least prominent element: muted, no
+            // icon, no red.
+            return section.child(
+                div()
+                    .text_size(px(12.5 * zoom))
+                    .text_color(muted)
+                    .child("No hazards recorded"),
+            );
+        }
+        for (index, hazard) in hazards.into_iter().enumerate() {
+            section = section.child(
+                h_flex()
+                    .mt_1()
+                    .gap_2()
+                    .items_start()
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(hazard_color.alpha(0.35))
+                    .bg(hazard_color.alpha(0.1))
+                    .child(div().flex_none().text_color(hazard_color).child("\u{26a0}"))
+                    .child(div().flex_1().text_size(px(13.0 * zoom)).child(hazard))
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("workcat-hazard-remove-{index}")))
+                            .flex_none()
+                            .px_1()
+                            .text_color(muted)
+                            .cursor_pointer()
+                            .hover(|this| this.text_color(hazard_color))
+                            .tooltip(Tooltip::text("Remove hazard"))
+                            .child("\u{00d7}")
+                            .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
+                                this.remove_hazard(index, cx);
+                            })),
+                    ),
+            );
+        }
+        section
+    }
+
     fn render_body(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let item = self.focused_item(cx);
+        self.sync_focused(item.as_ref(), cx);
         self.sync_notes_editor(item.as_ref(), window, cx);
         let colors = cx.theme().colors().clone();
         let muted = colors.text_muted;
@@ -494,18 +661,6 @@ impl WorkcatDetailView {
         };
         let zoom = self.zoom;
         let status = item.status;
-        let status_color = WorkcatMapView::status_color(status, cx);
-
-        let section = |name: &str| -> Option<String> {
-            item.sections
-                .iter()
-                .find(|(heading, _)| heading.eq_ignore_ascii_case(name))
-                .map(|(_, body)| body.clone())
-                .filter(|body| !body.trim().is_empty())
-        };
-        let next_body = section("Next");
-        let context_body = section("Context");
-        let hazards_body = section("Hazards");
 
         let mut body = v_flex()
             .id("workcat-detail-body")
@@ -523,14 +678,14 @@ impl WorkcatDetailView {
                 .child(item.subject.clone()),
         );
 
-        // Meta row: the status pill (opens the menu) and the item id8,
-        // standing in for the mockup's commit hash.
+        // Meta row: the status pill (the sole status control) and the
+        // item id8, standing in for the mockup's commit hash.
         body = body.child(
             h_flex()
                 .items_center()
                 .gap_2()
                 .flex_wrap()
-                .child(self.render_status_pill(status, status_color, zoom, cx))
+                .child(self.render_status_pill(status, zoom, cx))
                 .child(
                     div()
                         .id("workcat-hash")
@@ -541,105 +696,44 @@ impl WorkcatDetailView {
                 ),
         );
 
-        // Actions: the primary transition split button plus handoff and
-        // locate.
-        body = body.child(self.render_actions(status, cx));
+        // Actions.
+        body = body.child(self.render_actions(cx));
 
-        // Next callout.
+        // Canceled undo affordance (offered for a few seconds).
+        if self.undo_prev.is_some() {
+            body = body.child(
+                h_flex()
+                    .mt_1()
+                    .gap_2()
+                    .items_center()
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .bg(colors.element_background)
+                    .border_1()
+                    .border_color(colors.border)
+                    .child(div().flex_1().text_size(px(13.0 * zoom)).child("Marked as canceled"))
+                    .child(
+                        Button::new("workcat-undo-cancel", "Undo")
+                            .style(ButtonStyle::Outlined)
+                            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                                this.undo_cancel(window, cx);
+                            })),
+                    ),
+            );
+        }
+
+        // Context: the handoff reference chip, rendered exactly once.
         body = body.child(
             v_flex()
-                .mt_1()
-                .p_3()
-                .rounded_md()
-                .bg(accent.alpha(0.1))
-                .child(section_label("Next", accent, px(10.5 * zoom)))
-                .child(
-                    div()
-                        .text_size(px(13.5 * zoom))
-                        .text_color(accent)
-                        .child(next_body.unwrap_or_else(|| "No next step recorded.".to_string())),
-                ),
+                .child(section_label("Context", muted, px(10.5 * zoom)))
+                .child(self.render_context_chip(&item.reference, cx)),
         );
 
-        // Context: the handoff reference chip, plus any Context body.
-        let mut context = v_flex()
-            .child(section_label("Context", muted, px(10.5 * zoom)))
-            .child(self.render_context_chip(&item.reference, cx));
-        if let Some(context_body) = context_body {
-            for line in context_body.lines() {
-                if line.trim().is_empty() {
-                    continue;
-                }
-                context = context.child(
-                    div()
-                        .pt_1()
-                        .text_size(px(13.5 * zoom))
-                        .child(line.to_string()),
-                );
-            }
-        }
-        body = body.child(context);
-
-        // Any remaining brief sections (e.g. State) in file order.
-        for (heading, section_body) in &item.sections {
-            if matches!(
-                heading.to_ascii_lowercase().as_str(),
-                "next" | "context" | "hazards" | "notes"
-            ) {
-                continue;
-            }
-            body = body.child(section_label(heading, accent, px(10.5 * zoom)));
-            for line in section_body.lines() {
-                if line.trim().is_empty() {
-                    body = body.child(div().h_2());
-                    continue;
-                }
-                body = body.child(
-                    div()
-                        .py_0p5()
-                        .text_size(px(13.5 * zoom))
-                        .child(line.to_string()),
-                );
-            }
-        }
-
         // Hazards.
-        body = body.child(section_label("Hazards", muted, px(10.5 * zoom)));
-        let hazards: Vec<String> = hazards_body
-            .as_deref()
-            .unwrap_or_default()
-            .lines()
-            .map(|line| line.trim().trim_start_matches("- ").to_string())
-            .filter(|line| !line.is_empty())
-            .collect();
-        if hazards.is_empty() {
-            body = body.child(
-                div()
-                    .text_size(px(12.5 * zoom))
-                    .text_color(muted)
-                    .child("None recorded"),
-            );
-        } else {
-            let error = cx.theme().status().error;
-            for hazard in hazards {
-                body = body.child(
-                    h_flex()
-                        .mt_1()
-                        .gap_2()
-                        .items_start()
-                        .px_2()
-                        .py_1()
-                        .rounded_md()
-                        .border_1()
-                        .border_color(error.alpha(0.35))
-                        .bg(error.alpha(0.1))
-                        .child(div().flex_none().text_color(error).child("\u{26a0}"))
-                        .child(div().text_size(px(13.0 * zoom)).child(hazard)),
-                );
-            }
-        }
+        body = body.child(self.render_hazards(&item, zoom, cx));
 
-        // Notes: an autosaving field with a save/status line.
+        // Notes: an autosaving field with a status/save line.
         body = body
             .child(section_label("Notes", muted, px(10.5 * zoom)))
             .child(
@@ -661,22 +755,31 @@ impl WorkcatDetailView {
                     .child(self.status.clone()),
             );
 
-        // Footer: the dependency count.
+        // Footer: dependency count (dimmed when zero) and last update.
         let deps = item.depends_on.len();
-        body = body.child(
-            h_flex()
-                .mt_3()
-                .pt_2()
-                .gap_4()
-                .border_t_1()
-                .border_color(colors.border)
-                .text_size(px(12.0))
-                .text_color(muted)
-                .child(format!(
-                    "{deps} {}",
-                    if deps == 1 { "dependency" } else { "dependencies" }
-                )),
-        );
+        let mut footer = h_flex()
+            .mt_3()
+            .pt_2()
+            .gap_2()
+            .flex_wrap()
+            .border_t_1()
+            .border_color(colors.border)
+            .text_size(px(12.0))
+            .text_color(muted)
+            .child(
+                div()
+                    .opacity(if deps == 0 { 0.6 } else { 1.0 })
+                    .child(format!(
+                        "{deps} {}",
+                        if deps == 1 { "dependency" } else { "dependencies" }
+                    )),
+            );
+        if let Some(updated) = item.updated_at.as_deref().and_then(humanize_timestamp) {
+            footer = footer
+                .child(div().child("\u{00b7}"))
+                .child(div().child(format!("updated {updated}")));
+        }
+        body = body.child(footer);
 
         body.into_any_element()
     }
@@ -693,6 +796,21 @@ fn section_label(text: &str, color: Hsla, size: Pixels) -> Div {
         .child(text.to_uppercase())
 }
 
+/// The focused item's hazards, one per non-empty line of its `##
+/// Hazards` section (bullet markers stripped).
+fn hazard_lines(item: &ItemMeta) -> Vec<String> {
+    item.sections
+        .iter()
+        .find(|(heading, _)| heading.eq_ignore_ascii_case("hazards"))
+        .map(|(_, body)| {
+            body.lines()
+                .map(|line| line.trim().trim_start_matches("- ").trim().to_string())
+                .filter(|line| !line.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Elide the middle of a path so a long `ref` fits on one line
 /// (`a/b/c/d.md` -> `a/\u{2026}/d.md`), matching the mockup's chip.
 fn shorten_reference(reference: &str) -> String {
@@ -701,6 +819,31 @@ fn shorten_reference(reference: &str) -> String {
         return reference.to_string();
     }
     format!("{}/\u{2026}/{}", parts[0], parts[parts.len() - 1])
+}
+
+/// Humanize an ISO-ish `updated_at` (`2026-07-07T15:40:...` or
+/// `2026-07-07 15:40:00`) to the footer form `Jul 7, 3:40 PM`. Returns
+/// `None` if it can't be parsed, so the footer just omits it.
+fn humanize_timestamp(raw: &str) -> Option<String> {
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let (date, rest) = raw.trim().split_once(['T', ' '])?;
+    let mut date_parts = date.split('-');
+    let _year = date_parts.next()?;
+    let month: usize = date_parts.next()?.parse().ok()?;
+    let day: u32 = date_parts.next()?.parse().ok()?;
+    let month_name = MONTHS.get(month.checked_sub(1)?)?;
+    let mut time_parts = rest.split(':');
+    let hour: u32 = time_parts.next()?.parse().ok()?;
+    let minute: u32 = time_parts.next()?.parse().ok()?;
+    let (hour12, meridiem) = match hour {
+        0 => (12, "AM"),
+        1..=11 => (hour, "AM"),
+        12 => (12, "PM"),
+        _ => (hour - 12, "PM"),
+    };
+    Some(format!("{month_name} {day}, {hour12}:{minute:02} {meridiem}"))
 }
 
 impl Focusable for WorkcatDetailView {

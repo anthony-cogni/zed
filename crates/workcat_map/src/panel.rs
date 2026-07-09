@@ -1052,26 +1052,47 @@ impl WorkcatMapView {
     /// brief file re-materializes at the next checkpoint's fold.
     /// Returns a human-readable status line.
     pub fn save_notes_for(&mut self, id: &str, text: String, cx: &mut Context<Self>) -> String {
+        self.save_section_for(id, "Notes", text, cx)
+    }
+
+    /// Whole-section replace of any brief section (`brief_edited`,
+    /// whole-section, workcat-db commit 87fb2b8). Backs both the Notes
+    /// editor and the editable Hazards list. Returns a human-readable
+    /// status line; no-ops (and says so) when the text is unchanged.
+    pub(crate) fn save_section_for(
+        &mut self,
+        id: &str,
+        heading: &str,
+        text: String,
+        cx: &mut Context<Self>,
+    ) -> String {
         let Some(item) = self.items.iter_mut().find(|item| item.id == id) else {
             return format!("no item {id}");
         };
-        if item.notes().unwrap_or_default() == text {
-            return "notes unchanged".to_string();
+        let existing = item
+            .sections
+            .iter()
+            .find(|(section_heading, _)| section_heading.eq_ignore_ascii_case(heading))
+            .map(|(_, body)| body.as_str())
+            .unwrap_or_default();
+        if existing == text {
+            return format!("{} unchanged", heading.to_lowercase());
         }
         if let Some(section) = item
             .sections
             .iter_mut()
-            .find(|(heading, _)| heading.eq_ignore_ascii_case("notes"))
+            .find(|(section_heading, _)| section_heading.eq_ignore_ascii_case(heading))
         {
             section.1 = text.clone();
         } else {
-            item.sections.push(("Notes".to_string(), text.clone()));
+            item.sections.push((heading.to_string(), text.clone()));
         }
         let id = id.to_string();
-        self.append_to_log(store::brief_edited_event(&id, "Notes", &text), cx);
-        self.status = "notes saved (uncommitted)".into();
+        self.append_to_log(store::brief_edited_event(&id, heading, &text), cx);
+        let message = format!("{} saved (uncommitted)", heading.to_lowercase());
+        self.status = message.clone().into();
         cx.notify();
-        "notes saved (uncommitted)".to_string()
+        message
     }
 
     // === Writes ===
@@ -1094,6 +1115,23 @@ impl WorkcatMapView {
                 .ok();
             }
         }));
+    }
+
+    /// Set the focused item's status by value (the detail panel's undo
+    /// path). Thin wrapper over [`Self::set_status`].
+    pub(crate) fn set_focused_status(
+        &mut self,
+        status: Status,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.set_status(
+            &SetStatus {
+                status: status.as_str().to_string(),
+            },
+            window,
+            cx,
+        );
     }
 
     pub(crate) fn set_status(
@@ -1130,7 +1168,7 @@ impl WorkcatMapView {
         // event appends now; the checkpoint commits it plus any pending
         // drag events).
         self.pending_events += 1;
-        let message = format!("status: {} -> {}", id8, status.as_str());
+        let message = format!("status: {} -> {}", id8, status.label());
         let event = store::status_set_event(&id, status.as_str());
         self.spawn_checkpoint(Some(event), message, cx);
         cx.notify();
@@ -1216,24 +1254,13 @@ impl WorkcatMapView {
     ) {
         self.focused_node = Some(node_ix);
         let current = self.focused_item().map(|item| item.status);
-        let context_menu = ContextMenu::build(window, cx, |mut menu, _, _| {
-            menu = menu.context(self.focus_handle.clone()).header("Set Status");
-            for status in ALL_STATUSES {
-                let label = if current == Some(status) {
-                    format!("{} (current)", status.label())
-                } else {
-                    status.label().to_string()
-                };
-                menu = menu.action(
-                    label,
-                    Box::new(SetStatus {
-                        status: status.as_str().to_string(),
-                    }),
-                );
-            }
+        let map = cx.weak_entity();
+        let focus = self.focus_handle.clone();
+        let context_menu = ContextMenu::build(window, cx, move |menu, _, _| {
+            let menu = Self::populate_status_menu(menu.context(focus), current, map);
             menu.separator()
-                .action("Open Detail Panel", Box::new(ToggleDetail))
-                .action("Checkpoint Now", Box::new(Checkpoint))
+                .action("Open detail panel", Box::new(ToggleDetail))
+                .action("Checkpoint now", Box::new(Checkpoint))
         });
         self.show_context_menu(context_menu, position, window, cx);
     }
@@ -1315,19 +1342,66 @@ impl WorkcatMapView {
 
     // === Rendering ===
 
-    pub fn status_color(status: Status, cx: &App) -> Hsla {
-        let colors = cx.theme().status();
-        match status {
-            Status::NotStarted => colors.ignored,
-            Status::Started => colors.info,
-            Status::Paused => colors.modified,
-            Status::Blocked => colors.error,
-            Status::Implemented => colors.created,
-            Status::Merged => colors.renamed,
-            Status::Complete => colors.success,
-            Status::Canceled => colors.hidden,
-            Status::Unknown => colors.conflict,
+    /// The single status->color source of truth: one saturated "dot"
+    /// color per status. Pill tints, the status menu, lens chips, and
+    /// node fills all derive from these via alpha/blend, so light and
+    /// dark mode fall out of blending the dot into the theme surface.
+    pub fn status_color(status: Status) -> Hsla {
+        Hsla::from(match status {
+            Status::NotStarted => gpui::rgb(0x888780),
+            Status::Started => gpui::rgb(0x378add),
+            Status::Paused => gpui::rgb(0xef9f27),
+            Status::Blocked => gpui::rgb(0xe24b4a),
+            Status::Implemented => gpui::rgb(0x97c459),
+            Status::Merged => gpui::rgb(0x639922),
+            Status::Complete => gpui::rgb(0x3b6d11),
+            Status::Canceled => gpui::rgb(0xb4b2a9),
+            Status::Unknown => gpui::rgb(0xc9c7be),
+        })
+    }
+
+    /// Shared "Set status" menu section (DR-003 ruling 8: one component
+    /// so the map node menu and the detail-panel pill never drift in
+    /// order, labels, shortcuts, or the current-status check). Statuses
+    /// run in lifecycle order with a divider before the terminal
+    /// choices; each entry carries the `SetStatus` action so the 1-9
+    /// keybindings show as badges and fire while the menu is open, and
+    /// picking one advances the map's focused item.
+    pub(crate) fn populate_status_menu(
+        mut menu: ContextMenu,
+        current: Option<Status>,
+        map: WeakEntity<WorkcatMapView>,
+    ) -> ContextMenu {
+        menu = menu.header("Set status");
+        let mut divided = false;
+        for status in ALL_STATUSES {
+            if status.is_terminal_choice() && !divided {
+                menu = menu.separator();
+                divided = true;
+            }
+            let map = map.clone();
+            menu = menu.toggleable_entry(
+                status.label(),
+                current == Some(status),
+                ui::IconPosition::Start,
+                Some(Box::new(SetStatus {
+                    status: status.as_str().to_string(),
+                })),
+                move |window, cx| {
+                    map.update(cx, |map, cx| {
+                        map.set_status(
+                            &SetStatus {
+                                status: status.as_str().to_string(),
+                            },
+                            window,
+                            cx,
+                        );
+                    })
+                    .ok();
+                },
+            );
         }
+        menu
     }
 
     fn render_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1410,7 +1484,7 @@ impl WorkcatMapView {
         for status in ALL_STATUSES {
             let visible = self.filter.visible_statuses.contains(&status);
             let count = counts.get(&status).copied().unwrap_or(0);
-            let status_color = Self::status_color(status, cx);
+            let status_color = Self::status_color(status);
             row = row.child(
                 h_flex()
                     .id(SharedString::from(format!("chip-{}", status.as_str())))
@@ -1420,6 +1494,8 @@ impl WorkcatMapView {
                     .rounded_md()
                     .border_1()
                     .cursor_pointer()
+                    // Zero-count lenses read as dimmed but stay clickable.
+                    .opacity(if count == 0 { 0.45 } else { 1.0 })
                     .border_color(if visible {
                         status_color.alpha(0.9)
                     } else {
@@ -1443,13 +1519,18 @@ impl WorkcatMapView {
                             .rounded_full()
                             .bg(status_color),
                     )
-                    .child(Label::new(format!("{count}")).size(LabelSize::Small).color(
-                        if visible {
-                            Color::Default
-                        } else {
-                            Color::Muted
-                        },
-                    ))
+                    // Dot + humanized name + count; the row doubles as
+                    // the map's status legend.
+                    .child(
+                        Label::new(status.label())
+                            .size(LabelSize::Small)
+                            .color(if visible { Color::Default } else { Color::Muted }),
+                    )
+                    .child(
+                        Label::new(format!("{count}"))
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    )
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
@@ -1479,48 +1560,6 @@ impl WorkcatMapView {
                 );
         }
         row
-    }
-
-    fn render_detail_strip(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
-        let item = self.focused_item()?;
-        let colors = cx.theme().colors().clone();
-        let status_color = Self::status_color(item.status, cx);
-        let strip = h_flex()
-            .w_full()
-            .px_2()
-            .py_1()
-            .gap_2()
-            .border_b_1()
-            .border_color(colors.border)
-            .bg(colors.element_background)
-            .id("workcat-detail-strip")
-            .cursor_pointer()
-            .tooltip(ui::Tooltip::text("Open in Workcat Detail panel (enter)"))
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _: &MouseDownEvent, window, cx| {
-                    this.toggle_detail(&ToggleDetail, window, cx);
-                    cx.stop_propagation();
-                }),
-            )
-            .child(div().w_2().h_2().rounded_full().bg(status_color))
-            .child(Label::new(truncate_to(&item.subject, 52)).weight(gpui::FontWeight::BOLD))
-            .child(
-                Label::new(item.status.as_str())
-                    .size(LabelSize::Small)
-                    .color(Color::Accent),
-            )
-            .child(
-                Label::new(format!("{} deps", item.depends_on.len()))
-                    .size(LabelSize::Small)
-                    .color(Color::Muted),
-            )
-            .child(
-                Label::new(truncate_to(&item.reference, 40))
-                    .size(LabelSize::Small)
-                    .color(Color::Muted),
-            );
-        Some(strip)
     }
 
     /// Dependency edges, drawn under the nodes: a line from each
@@ -1594,7 +1633,7 @@ impl WorkcatMapView {
         let node = &self.nodes[node_ix];
         let item = &self.items[node.item_ix];
         let colors = cx.theme().colors().clone();
-        let status_color = Self::status_color(item.status, cx);
+        let status_color = Self::status_color(item.status);
         let dragging = self.drag.as_ref().is_some_and(|drag| {
             drag.pressed_ix == node_ix || drag.starts.iter().any(|(ix, _)| *ix == node_ix)
         });
@@ -1873,7 +1912,6 @@ impl Render for WorkcatMapView {
             .bg(cx.theme().colors().panel_background)
             .child(self.render_header(cx))
             .child(self.render_filter_row(cx))
-            .children(self.render_detail_strip(cx))
             .child(self.render_field(cx))
             .children(self.context_menu.as_ref().map(|(menu, position, _)| {
                 deferred(
