@@ -18,6 +18,7 @@
 use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::rc::Rc;
+use std::time::Duration;
 
 use anyhow::Result;
 use editor::{Editor, EditorEvent};
@@ -120,6 +121,11 @@ const WORKCAT_MAP_PANEL_KEY: &str = "WorkcatMapPanel";
 const DEFAULT_WIDTH: f32 = 640.;
 /// ~16 words: four wrapped lines of ~30 characters.
 const MAX_LABEL_CHARS: usize = 118;
+/// How long the map waits after the last mutation before auto-checkpointing.
+const AUTO_CHECKPOINT_DELAY: Duration = Duration::from_secs(5);
+/// A lens with this name is applied automatically on load, so the last
+/// saved arrangement is the startup view.
+const DEFAULT_LENS: &str = "default";
 
 pub fn init(cx: &mut App) {
     cx.observe_new(|workspace: &mut Workspace, _, _| {
@@ -213,6 +219,11 @@ pub struct WorkcatMapView {
     context_menu: Option<(Entity<ContextMenu>, Point<Pixels>, Subscription)>,
     append_task: Option<Task<()>>,
     checkpoint_task: Option<Task<()>>,
+    /// Debounced auto-checkpoint timer, reset by every mutation.
+    auto_checkpoint_task: Option<Task<()>>,
+    /// Apply the "default" lens once, after the first load, to restore
+    /// the saved startup arrangement.
+    needs_default_lens: bool,
     _load_task: Task<()>,
     _subscriptions: Vec<Subscription>,
 }
@@ -312,6 +323,8 @@ impl WorkcatMapView {
             context_menu: None,
             append_task: None,
             checkpoint_task: None,
+            auto_checkpoint_task: None,
+            needs_default_lens: true,
             _load_task: load_task,
             _subscriptions: subscriptions,
         }
@@ -1157,6 +1170,27 @@ impl WorkcatMapView {
                 .ok();
             }
         }));
+        self.arm_auto_checkpoint(cx);
+    }
+
+    /// Debounced auto-checkpoint: every mutation (arriving through
+    /// `append_to_log`) restarts a timer, so a burst of edits settles
+    /// into a single checkpoint ~`AUTO_CHECKPOINT_DELAY` after the last
+    /// one. Dropping the prior task cancels the earlier timer. The
+    /// checkpoint's own progress ("acquiring lock", "folding", ...)
+    /// streams into the status line as before.
+    fn arm_auto_checkpoint(&mut self, cx: &mut Context<Self>) {
+        self.auto_checkpoint_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(AUTO_CHECKPOINT_DELAY)
+                .await;
+            this.update(cx, |this, cx| {
+                if this.pending_events > 0 && !this.checkpoint_running {
+                    this.spawn_checkpoint(None, "auto checkpoint".into(), cx);
+                }
+            })
+            .ok();
+        }));
     }
 
     /// Set the focused item's status by value (the detail panel's undo
@@ -1206,13 +1240,10 @@ impl WorkcatMapView {
         if !self.filter.visible_statuses.contains(&status) {
             self.rebuild_scene();
         }
-        // Status changes checkpoint immediately (DR-006 two-grain: the
-        // event appends now; the checkpoint commits it plus any pending
-        // drag events).
-        self.pending_events += 1;
-        let message = format!("status: {} -> {}", id8, status.label());
-        let event = store::status_set_event(&id, status.as_str());
-        self.spawn_checkpoint(Some(event), message, cx);
+        // Append the event and let the debounced auto-checkpoint commit
+        // it (with any pending drag/note events) once activity settles.
+        self.status = format!("status: {} -> {}", id8, status.label()).into();
+        self.append_to_log(store::status_set_event(&id, status.as_str()), cx);
         cx.notify();
     }
 
@@ -1929,6 +1960,21 @@ impl Focusable for WorkcatMapView {
 
 impl Render for WorkcatMapView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Once loaded, restore the saved startup arrangement by applying
+        // the "default" lens (filter + layout), so the map opens the way
+        // it was last left rather than on a mixed/degenerate layout.
+        if self.needs_default_lens && !self.loading {
+            self.needs_default_lens = false;
+            if self.lenses.contains_key(DEFAULT_LENS) {
+                self.apply_lens(
+                    &ApplyLens {
+                        name: DEFAULT_LENS.to_string(),
+                    },
+                    window,
+                    cx,
+                );
+            }
+        }
         if self.needs_initial_fit
             && !self.loading
             && self.scroll_handle.bounds().size.height > px(0.)
