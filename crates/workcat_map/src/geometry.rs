@@ -292,17 +292,50 @@ pub fn layered_layout(count: usize, edges: &[(usize, usize)]) -> Vec<(f32, f32)>
         assign_slots(&rows, &mut slot);
     }
 
-    // Positions: rows stacked vertically, each row centered.
-    let widest = rows.iter().map(Vec::len).max().unwrap_or(1) as f32;
+    // Positions: rows stacked vertically. Each node's x is the
+    // centroid of its own children's x (bottom-up, Reingold-Tilford
+    // style), not the whole row centered against the single widest
+    // row in the component — that produced a "funnel" whenever one
+    // row (e.g. a hub-of-hubs' grandchildren) was far wider than the
+    // rows above it, squeezing the shallow rows into a razor-thin
+    // sliver relative to a base row they have no direct relationship
+    // to (agent_notes/2026-07-16/workcat-map-layout-hierarchy-fix).
+    //
+    // Rows are processed bottom-to-top (`.rev()`) so every child's x
+    // is already known before its parent's centroid is computed.
+    // Within a row, nodes keep the barycenter order from above and
+    // get pushed apart left-to-right so CELL_WIDTH never overlaps.
+    // A childless node (a leaf, or every child still on the DFS stack
+    // of a cycle) falls back to its position in the barycenter order.
+    //
+    // This also resolves multi-parent nodes for free: a node's x
+    // depends only on its own children, never on which of several
+    // dependents points to it, so two dependents can each center over
+    // the same shared dependency without any "primary parent" rule.
     let mut positions = vec![(0.0, 0.0); count];
-    for (row_ix, row) in rows.iter().enumerate() {
-        let row_width = row.len() as f32;
-        let x0 = (widest - row_width) / 2.0 * CELL_WIDTH;
-        for (ix, &node) in row.iter().enumerate() {
-            positions[node] = (
-                x0 + ix as f32 * CELL_WIDTH,
-                row_ix as f32 * LAYER_ROW_HEIGHT,
-            );
+    let mut assigned = vec![false; count];
+    for (row_ix, row) in rows.iter().enumerate().rev() {
+        for (slot, &node) in row.iter().enumerate() {
+            let children_x: Vec<f32> = deps[node]
+                .iter()
+                .filter(|&&dep| assigned[dep])
+                .map(|&dep| positions[dep].0)
+                .collect();
+            let x = if children_x.is_empty() {
+                slot as f32 * CELL_WIDTH
+            } else {
+                children_x.iter().sum::<f32>() / children_x.len() as f32
+            };
+            positions[node] = (x, row_ix as f32 * LAYER_ROW_HEIGHT);
+        }
+        for w in 1..row.len() {
+            let min_x = positions[row[w - 1]].0 + CELL_WIDTH;
+            if positions[row[w]].0 < min_x {
+                positions[row[w]].0 = min_x;
+            }
+        }
+        for &node in row {
+            assigned[node] = true;
         }
     }
     // Normalize to a (0, 0) minimum.
@@ -482,16 +515,82 @@ mod tests {
         assert_eq!(positions[1].1, LAYER_ROW_HEIGHT);
         assert_eq!(positions[2].1, LAYER_ROW_HEIGHT);
         assert_eq!(positions[3].1, 2.0 * LAYER_ROW_HEIGHT);
-        // Single-node rows center over the two-node row.
+        // 0's x is the centroid of its own children (1 and 2), which
+        // is what fixes the funnel bug: a parent centers over the
+        // rows it actually connects to.
         let mid = (positions[1].0 + positions[2].0) / 2.0;
         assert_eq!(positions[0].0, mid);
-        assert_eq!(positions[3].0, mid);
+        // 3 is a leaf (no children of its own): it keeps its
+        // barycenter-order slot rather than centering under its two
+        // dependents, since only parents follow children, never the
+        // reverse (that reverse pull was the funnel's root cause).
+        assert_eq!(positions[3].0, 0.0);
     }
 
     #[test]
     fn layered_layout_survives_cycles() {
         let positions = layered_layout(2, &[(0, 1), (1, 0)]);
         assert_eq!(positions.len(), 2);
+    }
+
+    #[test]
+    fn layered_layout_avoids_the_funnel_for_a_hub_of_hubs() {
+        // A meta-epic (0) depends on three epics (1, 2, 3); epic 1 has
+        // ten children (4..14), epics 2 and 3 have two each (14..18).
+        // Rows: [0], [1, 2, 3], [4..18] (15 leaves). The bottom row is
+        // far wider than row 0/1 — exactly the shape that funneled
+        // under the old whole-row-vs-widest-row centering.
+        let mut edges = vec![(0, 1), (0, 2), (0, 3)];
+        let mut next_leaf = 4;
+        for epic in [1, 2, 3] {
+            let children = if epic == 1 { 10 } else { 2 };
+            for _ in 0..children {
+                edges.push((epic, next_leaf));
+                next_leaf += 1;
+            }
+        }
+        let count = next_leaf;
+        let positions = layered_layout(count, &edges);
+        // The meta-epic centers over its own three epics, not the
+        // wide leaf row: its x must fall strictly between the
+        // epics' min and max x (a real centroid), rather than sitting
+        // at the tiny sliver a whole-component-widest-row center
+        // would have produced against 15 leaves.
+        let epic_min = positions[1].0.min(positions[2].0).min(positions[3].0);
+        let epic_max = positions[1].0.max(positions[2].0).max(positions[3].0);
+        assert!(epic_min < epic_max, "epics must actually spread out");
+        assert!(positions[0].0 >= epic_min && positions[0].0 <= epic_max);
+        // The old bug centered row 0 against the 15-wide leaf row
+        // regardless of where the epics actually sit — a fixed
+        // `(15 - 1) / 2 * CELL_WIDTH` offset. The real centroid must
+        // land somewhere else, since the three epics are unevenly
+        // spread (one has 10 children, two have 2 each).
+        assert_ne!(positions[0].0, 7.0 * CELL_WIDTH);
+        // Epic 1 (ten children) centers over its own children's span,
+        // not the full 15-leaf row.
+        let epic1_children: Vec<f32> = (4..14).map(|ix| positions[ix].0).collect();
+        let epic1_min = epic1_children.iter().cloned().fold(f32::MAX, f32::min);
+        let epic1_max = epic1_children.iter().cloned().fold(f32::MIN, f32::max);
+        assert!(positions[1].0 >= epic1_min && positions[1].0 <= epic1_max);
+    }
+
+    #[test]
+    fn layered_layout_handles_a_dual_homed_node() {
+        // Two parents (0, 1) both depend on the same child (2) — the
+        // dual-homed-item shape (an item filed under two meta-epics).
+        // Neither parent needs a "primary parent" rule: each
+        // independently wants to center on 2's position; since they
+        // share a row they can't occupy the same slot, so collision
+        // resolution spreads them one CELL_WIDTH apart instead of one
+        // winning a "primary" claim over the other.
+        let positions = layered_layout(3, &[(0, 2), (1, 2)]);
+        assert_eq!(positions[0].1, 0.0);
+        assert_eq!(positions[1].1, 0.0);
+        assert_eq!(positions[2].1, LAYER_ROW_HEIGHT);
+        assert_eq!((positions[1].0 - positions[0].0).abs(), CELL_WIDTH);
+        // At least one parent lands exactly on the shared child's x
+        // (the one collision resolution didn't have to nudge).
+        assert!(positions[0].0 == positions[2].0 || positions[1].0 == positions[2].0);
     }
 
     #[test]
