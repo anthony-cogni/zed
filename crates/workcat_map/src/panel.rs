@@ -386,25 +386,13 @@ impl WorkcatMapView {
                 match loaded {
                     Ok((items, positions, lenses)) => {
                         this.lenses = lenses;
+                        // Lens positions are only restored by the
+                        // explicit `apply_lens` action, never re-merged
+                        // here: a periodic re-merge would stamp a lens's
+                        // saved-at-the-time snapshot back over any move
+                        // made since (see workcat-map-lens-position-revert
+                        // handoff — that reassertion was the bug).
                         this.apply_loaded(items, positions, cx);
-                        // `apply_loaded`'s positions come only from
-                        // `node_moved` events; a lens's own saved
-                        // positions (from `lens_saved`) are a separate
-                        // fold, merged in by `apply_lens`. Re-merge the
-                        // active lens's freshly reloaded positions here
-                        // too, or an external edit to the active lens
-                        // (e.g. a script writing a `lens_saved` event)
-                        // would reload everything else but leave this
-                        // lens's geometry stale until the next manual
-                        // re-apply.
-                        if let Some(name) = this.active_lens.clone()
-                            && let Some(lens) = this.lenses.get(&name)
-                        {
-                            for (id, x, y) in &lens.positions {
-                                this.positions.insert(id.clone(), (*x, *y));
-                            }
-                            this.rebuild_scene();
-                        }
                     }
                     Err(error) => {
                         log::error!("workcat_map: reload failed: {error:#}");

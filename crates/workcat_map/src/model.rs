@@ -183,8 +183,10 @@ impl FilterState {
 
 /// A saved lens: a named filter (DR-001's lensed map). Folded from
 /// `lens_saved` / `lens_deleted` events, last-write-wins per name.
-/// Positions are deliberately NOT part of a lens here (deviation from
-/// the SPA): node geometry is shared truth via `node_moved` events.
+/// Node geometry is still shared truth via `node_moved` events; a
+/// lens's own `positions` snapshot below is a secondary, explicit-only
+/// overlay (see its field doc), never reasserted outside of applying
+/// the lens.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Lens {
     pub name: String,
@@ -192,7 +194,10 @@ pub struct Lens {
     pub query: String,
     /// Node positions captured when the lens was saved: `(id, x, y)`.
     /// A lens organizes a workstream by geometry as well as by filter,
-    /// so applying it restores these positions (the SPA behavior).
+    /// so applying it restores these positions (the SPA behavior) —
+    /// but only at that explicit moment. Nothing else should re-merge
+    /// this snapshot over live positions, or a stale layout reasserts
+    /// itself over later moves (the lens-position-revert bug).
     pub positions: Vec<(String, f32, f32)>,
 }
 
