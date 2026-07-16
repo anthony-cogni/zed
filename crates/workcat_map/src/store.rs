@@ -127,6 +127,11 @@ pub fn load_lenses(db: &Path) -> Result<std::collections::BTreeMap<String, model
     Ok(model::fold_lenses(read_event_lines(db)?.lines()))
 }
 
+/// Fold explicit collapse/expand overrides from every event shard.
+pub fn load_collapsed(db: &Path) -> Result<HashMap<String, bool>> {
+    Ok(model::fold_node_collapsed(read_event_lines(db)?.lines()))
+}
+
 fn timestamp() -> String {
     chrono::Utc::now().to_rfc3339()
 }
@@ -184,6 +189,18 @@ pub fn lens_saved_event(
         "visible_statuses": visible_statuses,
         "query": query,
         "positions": positions,
+    })
+}
+
+/// Records an explicit collapse/expand override for one node,
+/// superseding the map's default-collapse heuristic for that id.
+pub fn node_collapsed_event(id: &str, collapsed: bool) -> serde_json::Value {
+    serde_json::json!({
+        "ts": timestamp(),
+        "actor": ACTOR,
+        "kind": "node_collapsed",
+        "id": id,
+        "collapsed": collapsed,
     })
 }
 
@@ -490,6 +507,22 @@ mod tests {
         assert_eq!(ev["positions"][0]["x"], 1.0);
         let ev = lens_deleted_event("mine");
         assert_eq!(ev["kind"], "lens_deleted");
+        let ev = node_collapsed_event("some-id", true);
+        assert_eq!(ev["kind"], "node_collapsed");
+        assert_eq!(ev["id"], "some-id");
+        assert_eq!(ev["collapsed"], true);
+    }
+
+    #[test]
+    fn collapsed_overrides_round_trip_through_the_log() {
+        let dir = tempfile::tempdir().unwrap();
+        append_event(dir.path(), &node_collapsed_event("a", true)).unwrap();
+        append_event(dir.path(), &node_collapsed_event("b", true)).unwrap();
+        append_event(dir.path(), &node_collapsed_event("a", false)).unwrap();
+        let collapsed = load_collapsed(dir.path()).unwrap();
+        assert_eq!(collapsed.len(), 2);
+        assert_eq!(collapsed["a"], false);
+        assert_eq!(collapsed["b"], true);
     }
 
     #[test]
