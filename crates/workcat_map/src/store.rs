@@ -114,6 +114,14 @@ pub fn load_positions(db: &Path) -> Result<HashMap<String, (f32, f32)>> {
     Ok(model::fold_node_positions(read_event_lines(db)?.lines()))
 }
 
+/// Fold node positions with each id's last-move timestamp, for the
+/// recency-guarded lens overlay on reload.
+pub fn load_positions_with_ts(db: &Path) -> Result<HashMap<String, (f32, f32, String)>> {
+    Ok(model::fold_node_positions_with_ts(
+        read_event_lines(db)?.lines(),
+    ))
+}
+
 /// Fold saved lenses from every event shard.
 pub fn load_lenses(db: &Path) -> Result<std::collections::BTreeMap<String, model::Lens>> {
     Ok(model::fold_lenses(read_event_lines(db)?.lines()))

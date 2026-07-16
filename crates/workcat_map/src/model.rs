@@ -194,11 +194,18 @@ pub struct Lens {
     pub query: String,
     /// Node positions captured when the lens was saved: `(id, x, y)`.
     /// A lens organizes a workstream by geometry as well as by filter,
-    /// so applying it restores these positions (the SPA behavior) —
-    /// but only at that explicit moment. Nothing else should re-merge
-    /// this snapshot over live positions, or a stale layout reasserts
-    /// itself over later moves (the lens-position-revert bug).
+    /// so applying it restores these positions (the SPA behavior).
+    /// On the automatic reload path the overlay is *guarded* by
+    /// `saved_at`: a node whose last `node_moved` is newer than the
+    /// lens keeps that newer position instead. That guard is what stops
+    /// both the stale-lens revert (a post-save move survives) and the
+    /// reload "explosion" (lens-only / pre-lens nodes keep the compact
+    /// layout instead of scattering to the raw `node_moved` fold).
     pub positions: Vec<(String, f32, f32)>,
+    /// Timestamp of the `lens_saved` event this lens was folded from
+    /// (RFC3339). Used as the recency cutoff for the guarded overlay
+    /// above. Empty for a lens with no recorded timestamp.
+    pub saved_at: String,
 }
 
 impl Lens {
@@ -261,6 +268,11 @@ pub fn fold_lenses<'a>(lines: impl Iterator<Item = &'a str>) -> BTreeMap<String,
                             .collect()
                     })
                     .unwrap_or_default();
+                let saved_at = value
+                    .get("ts")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string();
                 lenses.insert(
                     name.to_string(),
                     Lens {
@@ -268,6 +280,7 @@ pub fn fold_lenses<'a>(lines: impl Iterator<Item = &'a str>) -> BTreeMap<String,
                         visible_statuses,
                         query,
                         positions,
+                        saved_at,
                     },
                 );
             }
@@ -428,11 +441,12 @@ fn dep_id8(entry: &str) -> String {
 }
 
 /// Fold `node_moved` events (last-write-wins per item id) from raw
-/// JSON-lines. Lines that fail to parse or are not `node_moved` are
-/// ignored; callers feed every log line in log order.
-pub fn fold_node_positions<'a>(
+/// JSON-lines, carrying each id's last-move timestamp (RFC3339, empty
+/// if the event had none). Lines that fail to parse or are not
+/// `node_moved` are ignored; callers feed every log line in log order.
+pub fn fold_node_positions_with_ts<'a>(
     lines: impl Iterator<Item = &'a str>,
-) -> HashMap<String, (f32, f32)> {
+) -> HashMap<String, (f32, f32, String)> {
     let mut positions = HashMap::new();
     for line in lines {
         let line = line.trim();
@@ -452,9 +466,39 @@ pub fn fold_node_positions<'a>(
         ) else {
             continue;
         };
-        positions.insert(id.to_string(), (x as f32, y as f32));
+        let ts = value
+            .get("ts")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        positions.insert(id.to_string(), (x as f32, y as f32, ts));
     }
     positions
+}
+
+/// Fold `node_moved` events, discarding timestamps. Thin wrapper over
+/// [`fold_node_positions_with_ts`] for callers that only need geometry.
+pub fn fold_node_positions<'a>(
+    lines: impl Iterator<Item = &'a str>,
+) -> HashMap<String, (f32, f32)> {
+    fold_node_positions_with_ts(lines)
+        .into_iter()
+        .map(|(id, (x, y, _))| (id, (x, y)))
+        .collect()
+}
+
+/// Is RFC3339 timestamp `later` strictly after `earlier`? Parses both;
+/// if either fails to parse, returns `false` (treated as "not newer",
+/// so a lens overlay wins rather than a node scattering — fail safe
+/// toward the compact layout).
+pub fn ts_is_after(later: &str, earlier: &str) -> bool {
+    match (
+        chrono::DateTime::parse_from_rfc3339(later),
+        chrono::DateTime::parse_from_rfc3339(earlier),
+    ) {
+        (Ok(later), Ok(earlier)) => later > earlier,
+        _ => false,
+    }
 }
 
 /// Merge append-only event logs without a `git stash pop`. `committed`
@@ -778,5 +822,46 @@ Not started.
         assert_eq!(positions.len(), 2);
         assert_eq!(positions["aaa"], (5.5, 6.5));
         assert_eq!(positions["bbb"], (9.0, 8.0));
+    }
+
+    #[test]
+    fn fold_positions_carries_last_move_timestamp() {
+        let lines = [
+            r#"{"ts":"2026-07-01T00:00:00+00:00","kind":"node_moved","id":"a","x":1.0,"y":2.0}"#,
+            r#"{"ts":"2026-07-02T00:00:00+00:00","kind":"node_moved","id":"a","x":5.0,"y":6.0}"#,
+            r#"{"ts":"2026-07-01T12:00:00+00:00","kind":"node_moved","id":"b","x":9.0,"y":8.0}"#,
+        ];
+        let pos = fold_node_positions_with_ts(lines.into_iter());
+        assert_eq!(
+            pos["a"],
+            (5.0, 6.0, "2026-07-02T00:00:00+00:00".to_string())
+        );
+        assert_eq!(pos["b"].2, "2026-07-01T12:00:00+00:00");
+        // The plain fold agrees on geometry (it is the ts-carrying fold
+        // with timestamps stripped).
+        assert_eq!(fold_node_positions(lines.into_iter())["a"], (5.0, 6.0));
+    }
+
+    #[test]
+    fn ts_is_after_orders_rfc3339_and_fails_safe() {
+        let early = "2026-07-01T00:00:00+00:00";
+        let late = "2026-07-02T00:00:00+00:00";
+        assert!(ts_is_after(late, early));
+        assert!(!ts_is_after(early, late));
+        assert!(!ts_is_after(early, early));
+        // Unparseable inputs return false, so a lens overlay wins rather
+        // than a node scattering to the raw fold (fail safe to compact).
+        assert!(!ts_is_after("garbage", early));
+        assert!(!ts_is_after(early, ""));
+    }
+
+    #[test]
+    fn lens_fold_captures_saved_at() {
+        let lines = [
+            r#"{"ts":"2026-07-05T00:00:00+00:00","kind":"lens_saved","name":"x","visible_statuses":["blocked"],"query":"","positions":[{"id":"a","x":1.0,"y":2.0}]}"#,
+        ];
+        let lenses = fold_lenses(lines.into_iter());
+        assert_eq!(lenses["x"].saved_at, "2026-07-05T00:00:00+00:00");
+        assert_eq!(lenses["x"].positions, vec![("a".to_string(), 1.0, 2.0)]);
     }
 }
