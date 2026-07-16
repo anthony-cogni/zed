@@ -31,7 +31,10 @@ use gpui::{
 use ui::{ContextMenu, prelude::*};
 
 use crate::geometry;
-use crate::model::{ALL_STATUSES, FilterState, ItemMeta, Lens, Op, Status, UndoStack, ts_is_after};
+use crate::model::{
+    ALL_STATUSES, FilterState, ItemMeta, Lens, Op, Status, UndoStack, collapse_hidden,
+    effective_collapsed, ts_is_after,
+};
 use crate::store;
 
 actions!(
@@ -57,6 +60,9 @@ actions!(
         /// Opens the focused item in the Workcat Detail panel (or
         /// confirms the lens name while naming a lens).
         ToggleDetail,
+        /// Collapses the focused hub node (hiding its subtree) or
+        /// expands it back, flipping its current effective state.
+        ToggleCollapse,
         /// Re-lays out the visible nodes on the deterministic grid.
         AutoArrange,
         /// Packs connected components into a compact, viewport-shaped
@@ -138,6 +144,10 @@ struct MapNode {
     x: f32,
     y: f32,
     label: SharedString,
+    /// Count of descendants hidden because this node is collapsed; 0
+    /// when the node isn't a collapsed hub. Drives the "+N" expand
+    /// badge in `render_node`.
+    hidden_descendants: usize,
 }
 
 /// An in-flight drag gesture: the pressed node plus (for a group
@@ -207,6 +217,10 @@ pub struct WorkcatMapView {
     /// Saved lenses folded from the event log.
     lenses: BTreeMap<String, Lens>,
     active_lens: Option<String>,
+    /// Explicit collapse/expand overrides folded from `node_collapsed`
+    /// events, keyed by full item id. An id absent here follows the
+    /// default-collapse heuristic instead (see `is_hub`).
+    collapsed_overrides: HashMap<String, bool>,
     /// When true, the header shows the lens-name input.
     naming_lens: bool,
     lens_name_editor: Entity<Editor>,
@@ -285,12 +299,14 @@ impl WorkcatMapView {
                     let items = store::load_items(&db)?;
                     let positions = store::load_positions_with_ts(&db)?;
                     let lenses = store::load_lenses(&db)?;
-                    anyhow::Ok((items, positions, lenses))
+                    let collapsed = store::load_collapsed(&db)?;
+                    anyhow::Ok((items, positions, lenses, collapsed))
                 })
                 .await;
             this.update(cx, |this, cx| match loaded {
-                Ok((items, positions, lenses)) => {
+                Ok((items, positions, lenses, collapsed)) => {
                     this.lenses = lenses;
+                    this.collapsed_overrides = collapsed;
                     this.apply_loaded(items, positions, cx)
                 }
                 Err(error) => {
@@ -345,6 +361,7 @@ impl WorkcatMapView {
             search_editor,
             lenses: BTreeMap::new(),
             active_lens: None,
+            collapsed_overrides: HashMap::new(),
             naming_lens: false,
             lens_name_editor,
             undo_stack: UndoStack::default(),
@@ -385,14 +402,16 @@ impl WorkcatMapView {
                     let items = store::load_items(&db)?;
                     let positions = store::load_positions_with_ts(&db)?;
                     let lenses = store::load_lenses(&db)?;
-                    anyhow::Ok((items, positions, lenses))
+                    let collapsed = store::load_collapsed(&db)?;
+                    anyhow::Ok((items, positions, lenses, collapsed))
                 })
                 .await;
             this.update(cx, |this, cx| {
                 this.reload_in_flight = false;
                 match loaded {
-                    Ok((items, positions, lenses)) => {
+                    Ok((items, positions, lenses, collapsed)) => {
                         this.lenses = lenses;
+                        this.collapsed_overrides = collapsed;
                         this.apply_loaded(items, positions, cx);
                         // Re-overlay the active lens's saved layout, but
                         // guarded by recency: a node moved *after* the
@@ -500,6 +519,8 @@ impl WorkcatMapView {
         let mut visible: Vec<usize> = (0..self.items.len())
             .filter(|&ix| self.filter.matches(&self.items[ix]))
             .collect();
+        let (hidden_by_collapse, hidden_counts) = collapse_hidden(&self.items, &self.collapsed_overrides);
+        visible.retain(|ix| !hidden_by_collapse.contains(ix));
         visible.sort_by(|&a, &b| {
             let (a, b) = (&self.items[a], &self.items[b]);
             (a.status.layout_rank(), &a.subject).cmp(&(b.status.layout_rank(), &b.subject))
@@ -521,6 +542,7 @@ impl WorkcatMapView {
                     x,
                     y,
                     label: truncate(&item.subject).into(),
+                    hidden_descendants: hidden_counts.get(&item_ix).copied().unwrap_or(0),
                 }
             })
             .collect();
@@ -559,6 +581,39 @@ impl WorkcatMapView {
         self.nodes
             .iter()
             .position(|node| self.items[node.item_ix].id == id)
+    }
+
+    /// Toggle one item's collapse state: flips the *effective* current
+    /// state (not just the presence of an override), persists the
+    /// explicit override, and rebuilds so hidden descendants
+    /// appear/disappear immediately.
+    fn toggle_collapse(&mut self, id: &str, cx: &mut Context<Self>) {
+        let Some(item) = self.items.iter().find(|item| item.id == id) else {
+            return;
+        };
+        let now_collapsed = effective_collapsed(&self.collapsed_overrides, item);
+        let new_value = !now_collapsed;
+        let id8 = item.id8().to_string();
+        self.collapsed_overrides.insert(id.to_string(), new_value);
+        self.rebuild_scene();
+        self.status = format!("{id8} {}", if new_value { "collapsed" } else { "expanded" }).into();
+        self.append_to_log(store::node_collapsed_event(id, new_value), cx);
+        cx.notify();
+    }
+
+    fn toggle_focused_collapse(
+        &mut self,
+        _: &ToggleCollapse,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(node_ix) = self.focused_node else {
+            self.status = "no focused item to collapse/expand".into();
+            cx.notify();
+            return;
+        };
+        let id = self.items[self.nodes[node_ix].item_ix].id.clone();
+        self.toggle_collapse(&id, cx);
     }
 
     pub fn focused_item(&self) -> Option<&ItemMeta> {
@@ -1496,13 +1551,25 @@ impl WorkcatMapView {
     ) {
         self.focused_node = Some(node_ix);
         let current = self.focused_item().map(|item| item.status);
+        let item = &self.items[self.nodes[node_ix].item_ix];
+        let has_children = !item.depends_on.is_empty();
+        let collapsed = effective_collapsed(&self.collapsed_overrides, item);
         let map = cx.weak_entity();
         let focus = self.focus_handle.clone();
         let context_menu = ContextMenu::build(window, cx, move |menu, _, _| {
             let menu = Self::populate_status_menu(menu.context(focus), current, map);
-            menu.separator()
-                .action("Open detail panel", Box::new(ToggleDetail))
-                .action("Checkpoint now", Box::new(Checkpoint))
+            let menu = menu
+                .separator()
+                .action("Open detail panel", Box::new(ToggleDetail));
+            let menu = if has_children {
+                menu.action(
+                    if collapsed { "Expand" } else { "Collapse" },
+                    Box::new(ToggleCollapse),
+                )
+            } else {
+                menu
+            };
+            menu.action("Checkpoint now", Box::new(Checkpoint))
         });
         self.show_context_menu(context_menu, position, window, cx);
     }
@@ -1978,6 +2045,34 @@ impl WorkcatMapView {
                     .overflow_hidden()
                     .child(node.label.clone()),
             )
+            .when(node.hidden_descendants > 0, |this| {
+                // A collapsed hub's expand badge: its own hitbox stops
+                // propagation before the card's on_mouse_down below, so
+                // clicking it toggles collapse instead of starting a drag.
+                let id = item.id.clone();
+                let count = node.hidden_descendants;
+                this.child(
+                    div()
+                        .absolute()
+                        .top(px(-6.0 * zoom))
+                        .right(px(-6.0 * zoom))
+                        .px(px(5.0 * zoom))
+                        .rounded_full()
+                        .border_1()
+                        .border_color(status_color)
+                        .bg(colors.panel_background.blend(status_color.alpha(0.5)))
+                        .text_size(px(10.0 * zoom))
+                        .cursor_pointer()
+                        .child(format!("+{count}"))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
+                                this.toggle_collapse(&id, cx);
+                                cx.stop_propagation();
+                            }),
+                        ),
+                )
+            })
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, event: &MouseDownEvent, window, cx| {
@@ -2193,6 +2288,7 @@ impl Render for WorkcatMapView {
             .on_action(cx.listener(Self::undo))
             .on_action(cx.listener(Self::redo))
             .on_action(cx.listener(Self::toggle_detail))
+            .on_action(cx.listener(Self::toggle_focused_collapse))
             .on_action(cx.listener(Self::auto_arrange))
             .on_action(cx.listener(Self::squeeze))
             .on_action(cx.listener(Self::fit))

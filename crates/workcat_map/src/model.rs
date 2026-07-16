@@ -487,6 +487,98 @@ pub fn fold_node_positions<'a>(
         .collect()
 }
 
+/// A node with more direct children than this is a "hub" (a
+/// meta-epic) and defaults to collapsed in the map, so its subtree
+/// never renders 100+ nodes flat before a person opts in. An ordinary
+/// epic (~5-9 children) stays under this; a meta-epic (20+) is well
+/// over it. `node_collapsed` events override this default per node
+/// either way.
+pub const AUTO_COLLAPSE_CHILD_THRESHOLD: usize = 12;
+
+/// A "hub" has enough direct children that rendering its whole
+/// subtree flat would sprawl; it defaults to collapsed absent an
+/// explicit override.
+pub fn is_hub(item: &ItemMeta) -> bool {
+    item.depends_on.len() > AUTO_COLLAPSE_CHILD_THRESHOLD
+}
+
+/// Whether `item` is collapsed right now: an explicit `node_collapsed`
+/// override wins; otherwise a hub defaults to collapsed and everything
+/// else defaults to expanded.
+pub fn effective_collapsed(overrides: &HashMap<String, bool>, item: &ItemMeta) -> bool {
+    overrides.get(&item.id).copied().unwrap_or_else(|| is_hub(item))
+}
+
+/// Every item (by index into `items`) hidden because some ancestor is
+/// collapsed, plus — for each collapsed item that is itself visible —
+/// how many of its own descendants that hides (the map's "+N" expand
+/// badge). Operates over the whole graph, independent of any filter.
+pub fn collapse_hidden(
+    items: &[ItemMeta],
+    overrides: &HashMap<String, bool>,
+) -> (HashSet<usize>, HashMap<usize, usize>) {
+    let by_id8: HashMap<&str, usize> = items
+        .iter()
+        .enumerate()
+        .map(|(ix, item)| (item.id8(), ix))
+        .collect();
+    let mut hidden = HashSet::new();
+    let mut hidden_counts = HashMap::new();
+    for (ix, item) in items.iter().enumerate() {
+        if !effective_collapsed(overrides, item) {
+            continue;
+        }
+        let mut stack: Vec<usize> = item
+            .depends_on
+            .iter()
+            .filter_map(|dep| by_id8.get(dep.as_str()).copied())
+            .collect();
+        let mut descendants = HashSet::new();
+        while let Some(child_ix) = stack.pop() {
+            if !descendants.insert(child_ix) {
+                continue;
+            }
+            for dep in &items[child_ix].depends_on {
+                if let Some(&next) = by_id8.get(dep.as_str()) {
+                    stack.push(next);
+                }
+            }
+        }
+        hidden.extend(&descendants);
+        hidden_counts.insert(ix, descendants.len());
+    }
+    (hidden, hidden_counts)
+}
+
+/// Fold `node_collapsed` events (last-write-wins per item id) from raw
+/// JSON-lines into an explicit override map: `true`/`false` as last
+/// written. An id absent here has no explicit override — the map
+/// falls back to its own default-collapse heuristic (a "hub" node,
+/// one with an unusually large fan-out) for that id.
+pub fn fold_node_collapsed<'a>(lines: impl Iterator<Item = &'a str>) -> HashMap<String, bool> {
+    let mut collapsed = HashMap::new();
+    for line in lines {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if value.get("kind").and_then(|k| k.as_str()) != Some("node_collapsed") {
+            continue;
+        }
+        let (Some(id), Some(is_collapsed)) = (
+            value.get("id").and_then(|v| v.as_str()),
+            value.get("collapsed").and_then(|v| v.as_bool()),
+        ) else {
+            continue;
+        };
+        collapsed.insert(id.to_string(), is_collapsed);
+    }
+    collapsed
+}
+
 /// Is RFC3339 timestamp `later` strictly after `earlier`? Parses both;
 /// if either fails to parse, returns `false` (treated as "not newer",
 /// so a lens overlay wins rather than a node scattering — fail safe
@@ -840,6 +932,77 @@ Not started.
         // The plain fold agrees on geometry (it is the ts-carrying fold
         // with timestamps stripped).
         assert_eq!(fold_node_positions(lines.into_iter())["a"], (5.0, 6.0));
+    }
+
+    fn item_with_deps(subject: &str, depends_on: Vec<&str>) -> ItemMeta {
+        ItemMeta {
+            id: subject.into(),
+            subject: subject.into(),
+            reference: "r".into(),
+            status: Status::Started,
+            updated_at: None,
+            depends_on: depends_on.into_iter().map(String::from).collect(),
+            sections: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn hub_default_collapse_follows_child_count_unless_overridden() {
+        let hub = item_with_deps("hub", (0..13).map(|_| "x").collect());
+        let plain = item_with_deps("plain", vec!["a", "b"]);
+        assert!(is_hub(&hub));
+        assert!(!is_hub(&plain));
+        let overrides = HashMap::new();
+        assert!(effective_collapsed(&overrides, &hub));
+        assert!(!effective_collapsed(&overrides, &plain));
+        // An explicit override beats the default either direction.
+        let mut overrides = HashMap::new();
+        overrides.insert("hub".to_string(), false);
+        overrides.insert("plain".to_string(), true);
+        assert!(!effective_collapsed(&overrides, &hub));
+        assert!(effective_collapsed(&overrides, &plain));
+    }
+
+    #[test]
+    fn collapse_hidden_hides_the_whole_subtree_and_counts_it() {
+        // hub -> mid -> leaf1, leaf2; mid also -> leaf3. Collapsing hub
+        // hides mid, leaf1, leaf2, leaf3 (transitively), but a
+        // standalone item outside the subtree stays visible.
+        let ids: Vec<&str> = (0..13).map(|_| "pad").collect();
+        let mut hub_deps = vec!["mid"];
+        hub_deps.extend(ids);
+        let items = vec![
+            item_with_deps("hub", hub_deps),
+            item_with_deps("mid", vec!["leaf1", "leaf2", "leaf3"]),
+            item_with_deps("leaf1", vec![]),
+            item_with_deps("leaf2", vec![]),
+            item_with_deps("leaf3", vec![]),
+            item_with_deps("standalone", vec![]),
+        ];
+        let overrides = HashMap::new();
+        let (hidden, counts) = collapse_hidden(&items, &overrides);
+        // hub (ix 0) is a hub by child count and stays visible itself.
+        assert!(!hidden.contains(&0));
+        for ix in 1..5 {
+            assert!(hidden.contains(&ix), "item at {ix} should be hidden");
+        }
+        assert!(!hidden.contains(&5), "standalone item must stay visible");
+        assert_eq!(counts[&0], 4);
+    }
+
+    #[test]
+    fn fold_collapsed_last_write_wins() {
+        let lines = [
+            r#"{"kind":"node_collapsed","id":"a","collapsed":true}"#,
+            r#"{"kind":"node_moved","id":"a","x":1,"y":2}"#,
+            r#"{"kind":"node_collapsed","id":"b","collapsed":true}"#,
+            "garbage",
+            r#"{"kind":"node_collapsed","id":"a","collapsed":false}"#,
+        ];
+        let collapsed = fold_node_collapsed(lines.into_iter());
+        assert_eq!(collapsed.len(), 2);
+        assert_eq!(collapsed["a"], false);
+        assert_eq!(collapsed["b"], true);
     }
 
     #[test]
