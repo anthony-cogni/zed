@@ -511,12 +511,24 @@ pub fn effective_collapsed(overrides: &HashMap<String, bool>, item: &ItemMeta) -
 
 /// Every item (by index into `items`) hidden because some ancestor is
 /// collapsed, plus — for each collapsed item that is itself visible —
-/// how many of its own descendants that hides (the map's "+N" expand
-/// badge). Operates over the whole graph, independent of any filter.
+/// how many of its own descendants that still hides (the map's "+N"
+/// expand badge), plus every item that must be forced visible despite
+/// not passing the caller's filter on its own.
+///
+/// Operates over the whole graph, independent of any filter, except for
+/// `reveal`: any item in `reveal` that would otherwise be hidden stays
+/// visible, along with every ancestor between it and its collapsed hub
+/// (so the dependency edges leading to it still make sense on screen)
+/// — those ancestors land in the returned `revealed` set even though
+/// they are not themselves in `reveal`. Non-matching siblings under the
+/// same hub stay hidden. This is a pure view-level computation — it
+/// never writes to `overrides`. Pass an empty `reveal` set to get plain
+/// collapse with nothing carved out (and an empty `revealed` back).
 pub fn collapse_hidden(
     items: &[ItemMeta],
     overrides: &HashMap<String, bool>,
-) -> (HashSet<usize>, HashMap<usize, usize>) {
+    reveal: &HashSet<usize>,
+) -> (HashSet<usize>, HashMap<usize, usize>, HashSet<usize>) {
     let by_id8: HashMap<&str, usize> = items
         .iter()
         .enumerate()
@@ -524,6 +536,7 @@ pub fn collapse_hidden(
         .collect();
     let mut hidden = HashSet::new();
     let mut hidden_counts = HashMap::new();
+    let mut revealed = HashSet::new();
     for (ix, item) in items.iter().enumerate() {
         if !effective_collapsed(overrides, item) {
             continue;
@@ -533,6 +546,7 @@ pub fn collapse_hidden(
             .iter()
             .filter_map(|dep| by_id8.get(dep.as_str()).copied())
             .collect();
+        let mut parent: HashMap<usize, usize> = HashMap::new();
         let mut descendants = HashSet::new();
         while let Some(child_ix) = stack.pop() {
             if !descendants.insert(child_ix) {
@@ -540,14 +554,29 @@ pub fn collapse_hidden(
             }
             for dep in &items[child_ix].depends_on {
                 if let Some(&next) = by_id8.get(dep.as_str()) {
+                    parent.entry(next).or_insert(child_ix);
                     stack.push(next);
                 }
             }
         }
-        hidden.extend(&descendants);
-        hidden_counts.insert(ix, descendants.len());
+        let mut this_hub_revealed = HashSet::new();
+        for &descendant_ix in &descendants {
+            if !reveal.contains(&descendant_ix) {
+                continue;
+            }
+            let mut cur = descendant_ix;
+            while this_hub_revealed.insert(cur) {
+                match parent.get(&cur) {
+                    Some(&p) => cur = p,
+                    None => break,
+                }
+            }
+        }
+        hidden.extend(descendants.iter().filter(|d| !this_hub_revealed.contains(d)));
+        hidden_counts.insert(ix, descendants.len() - this_hub_revealed.len());
+        revealed.extend(this_hub_revealed);
     }
-    (hidden, hidden_counts)
+    (hidden, hidden_counts, revealed)
 }
 
 /// Fold `node_collapsed` events (last-write-wins per item id) from raw
@@ -980,7 +1009,7 @@ Not started.
             item_with_deps("standalone", vec![]),
         ];
         let overrides = HashMap::new();
-        let (hidden, counts) = collapse_hidden(&items, &overrides);
+        let (hidden, counts, revealed) = collapse_hidden(&items, &overrides, &HashSet::new());
         // hub (ix 0) is a hub by child count and stays visible itself.
         assert!(!hidden.contains(&0));
         for ix in 1..5 {
@@ -988,6 +1017,43 @@ Not started.
         }
         assert!(!hidden.contains(&5), "standalone item must stay visible");
         assert_eq!(counts[&0], 4);
+        assert!(revealed.is_empty());
+    }
+
+    #[test]
+    fn collapse_hidden_reveals_the_path_to_a_filter_match_only() {
+        // Same hub -> mid -> leaf1, leaf2, leaf3 shape. Only leaf2
+        // matches the active filter (e.g. it's the only one with a
+        // status the filter narrowed to). Revealing it must also reveal
+        // mid (the ancestor connecting it to the hub), but leaf1 and
+        // leaf3 — non-matching siblings under the same hub — stay
+        // hidden, and the "+N" badge count on hub drops accordingly.
+        let ids: Vec<&str> = (0..13).map(|_| "pad").collect();
+        let mut hub_deps = vec!["mid"];
+        hub_deps.extend(ids);
+        let items = vec![
+            item_with_deps("hub", hub_deps),
+            item_with_deps("mid", vec!["leaf1", "leaf2", "leaf3"]),
+            item_with_deps("leaf1", vec![]),
+            item_with_deps("leaf2", vec![]),
+            item_with_deps("leaf3", vec![]),
+            item_with_deps("standalone", vec![]),
+        ];
+        let overrides = HashMap::new();
+        let leaf2_ix = 3;
+        let reveal: HashSet<usize> = [leaf2_ix].into_iter().collect();
+        let (hidden, counts, revealed) = collapse_hidden(&items, &overrides, &reveal);
+        let mid_ix = 1;
+        let leaf1_ix = 2;
+        let leaf3_ix = 4;
+        assert!(revealed.contains(&mid_ix), "mid must be revealed as leaf2's ancestor");
+        assert!(revealed.contains(&leaf2_ix));
+        assert!(!hidden.contains(&mid_ix));
+        assert!(!hidden.contains(&leaf2_ix));
+        assert!(hidden.contains(&leaf1_ix), "non-matching sibling stays hidden");
+        assert!(hidden.contains(&leaf3_ix), "non-matching sibling stays hidden");
+        // 4 descendants total, 2 revealed (mid, leaf2) -> 2 still hidden.
+        assert_eq!(counts[&0], 2);
     }
 
     #[test]
