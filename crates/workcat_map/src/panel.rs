@@ -31,7 +31,7 @@ use gpui::{
 use ui::{ContextMenu, prelude::*};
 
 use crate::geometry;
-use crate::model::{ALL_STATUSES, FilterState, ItemMeta, Lens, Op, Status, UndoStack};
+use crate::model::{ALL_STATUSES, FilterState, ItemMeta, Lens, Op, Status, UndoStack, ts_is_after};
 use crate::store;
 
 actions!(
@@ -171,6 +171,12 @@ pub struct WorkcatMapView {
     /// Owned geometry, keyed by full item id. Persisted `node_moved`
     /// positions plus pinned initial-grid slots.
     positions: HashMap<String, (f32, f32)>,
+    /// Last-move timestamp per id (RFC3339), tracking the recency of
+    /// each entry in `positions`. Folded from `node_moved` events on
+    /// load and stamped locally on every move. Compared against a
+    /// lens's `saved_at` so the guarded reload overlay never clobbers a
+    /// position that was moved after the lens was saved.
+    position_ts: HashMap<String, String>,
     /// Visible nodes (per the current filter).
     nodes: Vec<MapNode>,
     /// Dependency edges between visible nodes (dependent -> dependency).
@@ -277,7 +283,7 @@ impl WorkcatMapView {
                 .background_spawn(async move {
                     let db = store::resolve_db_dir();
                     let items = store::load_items(&db)?;
-                    let positions = store::load_positions(&db)?;
+                    let positions = store::load_positions_with_ts(&db)?;
                     let lenses = store::load_lenses(&db)?;
                     anyhow::Ok((items, positions, lenses))
                 })
@@ -323,6 +329,7 @@ impl WorkcatMapView {
             focus_handle,
             items: Vec::new(),
             positions: HashMap::new(),
+            position_ts: HashMap::new(),
             nodes: Vec::new(),
             edges: Vec::new(),
             focused_node: None,
@@ -376,7 +383,7 @@ impl WorkcatMapView {
                 .background_spawn(async move {
                     let db = store::resolve_db_dir();
                     let items = store::load_items(&db)?;
-                    let positions = store::load_positions(&db)?;
+                    let positions = store::load_positions_with_ts(&db)?;
                     let lenses = store::load_lenses(&db)?;
                     anyhow::Ok((items, positions, lenses))
                 })
@@ -386,13 +393,24 @@ impl WorkcatMapView {
                 match loaded {
                     Ok((items, positions, lenses)) => {
                         this.lenses = lenses;
-                        // Lens positions are only restored by the
-                        // explicit `apply_lens` action, never re-merged
-                        // here: a periodic re-merge would stamp a lens's
-                        // saved-at-the-time snapshot back over any move
-                        // made since (see workcat-map-lens-position-revert
-                        // handoff — that reassertion was the bug).
                         this.apply_loaded(items, positions, cx);
+                        // Re-overlay the active lens's saved layout, but
+                        // guarded by recency: a node moved *after* the
+                        // lens was saved keeps its newer position, every
+                        // other lens node (including the many that only
+                        // ever had a position via the lens) takes the
+                        // lens's compact position. Without this, the bare
+                        // `node_moved` fold above scatters those lens-only
+                        // and stale-pre-lens nodes across the field — the
+                        // reload "explosion". With an unguarded re-overlay
+                        // instead, a post-save move would be reverted — the
+                        // original lens-position-revert bug. The guard is
+                        // what resolves both at once.
+                        if this.active_lens.is_some() {
+                            this.overlay_active_lens_positions(true);
+                            this.rebuild_scene();
+                            cx.notify();
+                        }
                     }
                     Err(error) => {
                         log::error!("workcat_map: reload failed: {error:#}");
@@ -415,17 +433,44 @@ impl WorkcatMapView {
         self.spawn_reload(cx);
     }
 
+    /// Persist a node move: append the `node_moved` event and stamp its
+    /// timestamp into `position_ts`, so a reload racing the (async)
+    /// append still treats the move as the most recent write for that
+    /// id and does not drop or revert it.
+    fn persist_move(&mut self, id: &str, x: f32, y: f32, cx: &mut Context<Self>) {
+        let event = store::node_moved_event(id, x, y);
+        if let Some(ts) = event.get("ts").and_then(|ts| ts.as_str()) {
+            self.position_ts.insert(id.to_string(), ts.to_string());
+        }
+        self.append_to_log(event, cx);
+    }
+
     fn apply_loaded(
         &mut self,
         items: Vec<ItemMeta>,
-        positions: HashMap<String, (f32, f32)>,
+        positions: HashMap<String, (f32, f32, String)>,
         cx: &mut Context<Self>,
     ) {
         let total_items = items.len();
         let total_edges: usize = items.iter().map(|item| item.depends_on.len()).sum();
         let persisted = positions.len();
         self.items = items;
-        self.positions = positions;
+        // Merge the freshly folded positions by recency rather than
+        // replacing wholesale: a local move stamped into `position_ts`
+        // that is newer than the just-read fold is kept, so a reload
+        // that races an in-flight `node_moved` append (the append is
+        // asynchronous) never drops the move. Otherwise the fold wins,
+        // which is how external writes from another process surface.
+        for (id, (x, y, ts)) in positions {
+            let keep_local = self
+                .position_ts
+                .get(&id)
+                .is_some_and(|local| ts_is_after(local, &ts));
+            if !keep_local {
+                self.positions.insert(id.clone(), (x, y));
+                self.position_ts.insert(id, ts);
+            }
+        }
         self.loading = false;
         self.rebuild_scene();
         log::info!(
@@ -649,8 +694,7 @@ impl WorkcatMapView {
             op_moves.push((id, start, at));
         }
         for (id, _, (x, y)) in &op_moves {
-            let event = store::node_moved_event(id, *x, *y);
-            self.append_to_log(event, cx);
+            self.persist_move(id, *x, *y, cx);
         }
         if !op_moves.is_empty() {
             self.undo_stack.push(Op::Move(op_moves));
@@ -756,7 +800,7 @@ impl WorkcatMapView {
                         node.x = x;
                         node.y = y;
                     }
-                    self.append_to_log(store::node_moved_event(id, x, y), cx);
+                    self.persist_move(id, x, y, cx);
                 }
             }
             Op::SetStatus(id, from, to) => {
@@ -1023,7 +1067,7 @@ impl WorkcatMapView {
         }
         let moved = op_moves.len();
         for (id, _, (x, y)) in &op_moves {
-            self.append_to_log(store::node_moved_event(id, *x, *y), cx);
+            self.persist_move(id, *x, *y, cx);
         }
         if !op_moves.is_empty() {
             self.undo_stack.push(Op::Move(op_moves));
@@ -1066,15 +1110,45 @@ impl WorkcatMapView {
         // Setting editor text re-fires BufferEdited, which clears
         // active_lens; restore it after.
         self.active_lens = Some(action.name.clone());
-        // Restore the lens's saved geometry: a lens organizes a
-        // workstream by layout as well as filter. Older lenses saved no
-        // positions, so this is a no-op for them.
-        for (id, x, y) in &lens.positions {
-            self.positions.insert(id.clone(), (*x, *y));
-        }
+        // Explicit apply restores the lens's full saved layout (guard
+        // off): the user asked to go to this arrangement. Older lenses
+        // saved no positions, so this is a no-op for them.
+        self.overlay_active_lens_positions(false);
         self.rebuild_scene();
         self.status = format!("lens: {}", action.name).into();
         cx.notify();
+    }
+
+    /// Overlay the active lens's saved positions onto `self.positions`.
+    ///
+    /// When `guarded`, a node whose last move (`position_ts`) is newer
+    /// than the lens's `saved_at` keeps its current position instead of
+    /// being reset to the lens's — this is the reload path, where the
+    /// lens layout must be reasserted (so lens-only and pre-lens nodes
+    /// stay compact rather than exploding to the raw fold) without
+    /// reverting a move the user made after saving the lens. When not
+    /// guarded (an explicit apply), every lens position is restored.
+    fn overlay_active_lens_positions(&mut self, guarded: bool) {
+        let Some(name) = self.active_lens.clone() else {
+            return;
+        };
+        // Clone what we need so the `self.lenses` borrow ends before the
+        // `self.positions` mutation below.
+        let (saved_at, positions) = match self.lenses.get(&name) {
+            Some(lens) => (lens.saved_at.clone(), lens.positions.clone()),
+            None => return,
+        };
+        for (id, x, y) in positions {
+            if guarded
+                && self
+                    .position_ts
+                    .get(&id)
+                    .is_some_and(|moved| ts_is_after(moved, &saved_at))
+            {
+                continue;
+            }
+            self.positions.insert(id, (x, y));
+        }
     }
 
     /// All currently-visible nodes' geometry, snapshotted into a lens.
@@ -1095,10 +1169,16 @@ impl WorkcatMapView {
             .collect();
         let query = self.filter.query.trim().to_string();
         let positions = self.current_positions();
-        self.append_to_log(
-            store::lens_saved_event(&name, &visible, &query, &positions),
-            cx,
-        );
+        let event = store::lens_saved_event(&name, &visible, &query, &positions);
+        // The in-memory lens must carry the same `saved_at` the folded
+        // event will, so the guarded reload overlay uses a consistent
+        // recency cutoff before the next full reload folds it back in.
+        let saved_at = event
+            .get("ts")
+            .and_then(|ts| ts.as_str())
+            .unwrap_or_default()
+            .to_string();
+        self.append_to_log(event, cx);
         self.lenses.insert(
             name.clone(),
             Lens {
@@ -1106,6 +1186,7 @@ impl WorkcatMapView {
                 visible_statuses: visible.iter().map(|s| s.to_string()).collect(),
                 query,
                 positions,
+                saved_at,
             },
         );
         self.active_lens = Some(name.clone());
