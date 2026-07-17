@@ -516,10 +516,24 @@ impl WorkcatMapView {
     /// deterministic grid slot, which is then pinned into `positions`
     /// so later rebuilds keep it.
     fn rebuild_scene(&mut self) {
-        let mut visible: Vec<usize> = (0..self.items.len())
+        let matched: HashSet<usize> = (0..self.items.len())
             .filter(|&ix| self.filter.matches(&self.items[ix]))
             .collect();
-        let (hidden_by_collapse, hidden_counts) = collapse_hidden(&self.items, &self.collapsed_overrides);
+        // Only reveal collapse-hidden matches once the filter has
+        // actually been narrowed away from the default scope — under
+        // the default filter, collapse is expected to work as designed
+        // and nothing should be carved out of it.
+        let empty_reveal = HashSet::new();
+        let reveal = if self.filter.is_default() {
+            &empty_reveal
+        } else {
+            &matched
+        };
+        let (hidden_by_collapse, hidden_counts, revealed) =
+            collapse_hidden(&self.items, &self.collapsed_overrides, reveal);
+        let mut visible: Vec<usize> = (0..self.items.len())
+            .filter(|&ix| matched.contains(&ix) || revealed.contains(&ix))
+            .collect();
         visible.retain(|ix| !hidden_by_collapse.contains(ix));
         visible.sort_by(|&a, &b| {
             let (a, b) = (&self.items[a], &self.items[b]);
